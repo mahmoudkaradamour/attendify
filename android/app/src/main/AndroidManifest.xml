@@ -1,0 +1,280 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ================================================= -->
+    <!-- LOCATION PERMISSIONS                              -->
+    <!-- ================================================= -->
+
+    <!--
+        السماح بالوصول إلى الموقع الدقيق (GPS)
+        لتحديد موقع تسجيل الحضور بدقة.
+
+        Allows access to precise device location (GPS)
+        for accurate attendance location verification.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+
+    <!--
+        السماح بالوصول إلى الموقع التقريبي
+        كخيار احتياطي أو تحسين للأداء.
+
+        Allows access to approximate location
+        as a fallback or for performance reasons.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+
+    <!--
+        السماح بالوصول إلى الموقع أثناء عمل التطبيق في الخلفية
+        (سيتم تفعيله لاحقًا بعد قبول المستخدم).
+
+        Allows background location access
+        (will be used only after user consent).
+    -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+
+
+    <!-- ================================================= -->
+    <!-- FOREGROUND SERVICE & POWER                        -->
+    <!-- ================================================= -->
+
+    <!--
+        السماح بتشغيل Foreground Services
+        لضمان استمرار عمل التطبيق بالخلفية.
+
+        Allows running foreground services
+        to keep the app alive in background.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+
+    <!--
+        صلاحية مطلوبة لتشغيل Foreground Service من نوع الموقع
+        في إصدارات Android الحديثة (14+).
+
+        Required permission to run a location-type foreground service
+        on modern Android versions (14+).
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+
+    <!--
+        منع الجهاز من الدخول في وضع السكون
+        أثناء تنفيذ عمليات حساسة.
+
+        Prevents the device from sleeping
+        during critical operations.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <!--
+        طلب استثناء التطبيق من تحسين البطارية
+        لتجنب إيقافه في الخلفية.
+
+        Requests to ignore battery optimizations
+        so the app is not killed in background.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!--
+        إعادة تشغيل الخدمات بعد إعادة تشغيل الجهاز.
+
+        Allows restarting services
+        after device reboot.
+    -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+
+
+    <!-- ================================================= -->
+    <!-- CAMERA & BIOMETRIC                                -->
+    <!-- ================================================= -->
+
+    <!--
+        السماح باستخدام الكاميرا للتعرف على الوجه.
+
+        Allows using the camera for face recognition.
+    -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+
+    <!--
+        الكاميرا ميزة اختيارية وليست شرطًا أساسيًا.
+        التطبيق يعمل على أجهزة بدون كاميرا.
+
+        Camera is optional and not required.
+        The app can run on devices without a camera.
+    -->
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false"/>
+
+    <!--
+        السماح باستخدام التحقق البيومتري (بصمة / وجه)
+        عبر واجهات النظام فقط.
+
+        Allows using system biometric authentication
+        (fingerprint / face).
+    -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
+
+    <!--
+        دعم البصمة للإصدارات القديمة (قبل Android 9).
+
+        Legacy fingerprint support
+        for older Android versions.
+    -->
+    <uses-permission
+        android:name="android.permission.USE_FINGERPRINT"
+        android:maxSdkVersion="28"/>
+
+
+    <!-- ================================================= -->
+    <!-- NETWORK                                           -->
+    <!-- ================================================= -->
+
+    <!--
+        السماح بالاتصال بالإنترنت.
+
+        Allows internet access.
+    -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!--
+        معرفة حالة الاتصال ونوع الشبكة.
+
+        Allows checking network connectivity state.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+
+    <!--
+        قراءة معلومات شبكة Wi-Fi.
+
+        Allows reading Wi-Fi network information.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+
+
+    <!-- ================================================= -->
+    <!-- NOTIFICATIONS                                     -->
+    <!-- ================================================= -->
+
+    <!--
+        السماح بإرسال الإشعارات (Android 13+).
+
+        Allows posting notifications (Android 13+).
+    -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!--
+        السماح بالاهتزاز للإشعارات الحرجة.
+
+        Allows vibration for critical notifications.
+    -->
+    <uses-permission android:name="android.permission.VIBRATE"/>
+
+    <!--
+        قراءة سياسة عدم الإزعاج (DND).
+
+        Allows accessing notification policy (DND).
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY"/>
+
+    <!--
+        السماح بعرض نوافذ فوق التطبيقات الأخرى
+        (للتنبيهات الحرجة عند الحاجة).
+
+        Allows drawing over other apps
+        for critical alerts.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+
+
+    <!-- ================================================= -->
+    <!-- DEVICE INFO                                      -->
+    <!-- ================================================= -->
+
+    <!--
+        الوصول إلى معلومات عامة عن الجهاز
+        بدون معرفات حساسة.
+
+        Allows access to general device information
+        without sensitive identifiers.
+    -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+
+
+    <!-- ================================================= -->
+    <!-- APPLICATION                                      -->
+    <!-- ================================================= -->
+
+    <!-- Camera access -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Optional: run face recognition in foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
+    <uses-feature
+        android:name="android.hardware.camera.front"
+        android:required="false" />
+
+    <application
+        android:label="Attendify"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/NativeCameraTheme"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode">
+
+            <!-- ⚠️ نُبقي هذا للعودة إلى Flutter لاحقًا -->
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+        </activity>
+
+        <!--
+            خدمة Foreground الخاصة بالحضور.
+            تعمل حاليًا بدون موقع لتجنب القيود.
+
+            Attendance foreground service.
+            Runs without location until permissions are granted.
+        -->
+        <service
+            android:name=".service.AttendanceForegroundService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2"/>
+
+    </application>
+
+
+    <!-- ================================================= -->
+    <!-- QUERIES                                          -->
+    <!-- ================================================= -->
+
+    <!--
+        Required for Flutter text processing plugins.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+
+</manifest>
