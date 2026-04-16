@@ -106,7 +106,7 @@ dependencies {
     // CameraX Preview (للمستقبل)
     implementation("androidx.camera:camera-view:1.3.2")
 
-
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
 
 

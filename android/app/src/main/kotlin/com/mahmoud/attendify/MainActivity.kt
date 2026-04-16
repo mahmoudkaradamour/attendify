@@ -4,282 +4,361 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
-import androidx.camera.core.*
-import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import com.mahmoud.attendify.liveness.*
-import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
-import com.mahmoud.attendify.liveness.policy.LivenessPolicy
-import com.mahmoud.attendify.liveness.result.LivenessResult
 import java.util.concurrent.Executors
+
+/* =========================================================
+ * Imports من طبقات المشروع المختلفة
+ * ========================================================= */
+
+// 1) طبقة الكاميرا + جودة الصورة (Hardware & Pre‑ML)
+import com.mahmoud.attendify.camera.*
+
+// 2) طبقة الذكاء الاصطناعي للوجوه (Detection & Embedding)
+import com.mahmoud.attendify.face.*
+
+// 3) تحليل الجهاز والتكيّف مع قدراته
+import com.mahmoud.attendify.device.DeviceProfiler
+import com.mahmoud.attendify.config.AdaptiveConfig
+import com.mahmoud.attendify.config.AdaptiveConfigResolver
+
+// 4) جمع قياسات الأداء (observability)
+import com.mahmoud.attendify.metrics.RuntimeMetricsCollector
+
+// 5) نظام Liveness الزمني الحقيقي
+import com.mahmoud.attendify.liveness.LivenessOrchestrator
+import com.mahmoud.attendify.liveness.policy.LivenessPolicy
+import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
+import com.mahmoud.attendify.liveness.result.LivenessResult
 
 /**
  * MainActivity
  *
- * هذه النسخة:
- * ✅ تعمل Android فقط
- * ✅ جاهزة للربط مع Flutter بدون تغيير
- * ✅ لا تحتوي منطق UI
- * ✅ تدير تدفق:
- * Camera → Metrics → Liveness → (Match لاحقًا)
+ * هذا الملف هو "منسّق النظام" (Coordinator).
+ *
+ * ✅ ما الذي يفعله؟
+ * - يدير دورة حياة الكاميرا.
+ * - ينسّق الـ Pipeline بالترتيب الصحيح.
+ * - يطبّق Throttling و Async execution.
+ * - يربط كل الطبقات معًا بدون حسابات داخلية.
+ *
+ * ❌ ما الذي لا يفعله؟
+ * - لا يحسب EAR.
+ * - لا يحسب yaw / pitch.
+ * - لا يقرر إذا كان المستخدم حيًا.
+ * - لا يقرر تطابق الوجه.
+ *
+ * كل حساب أو قرار موجود في ملفه الصحيح.
  */
 class MainActivity : FlutterActivity() {
 
     /* =========================================================
-     * Flutter Channel (جاهز)
+     * Core runtime components
      * ========================================================= */
 
-    private lateinit var channel: MethodChannel
-    private val CHANNEL_NAME = "attendify/liveness"
+    // مدير الكاميرا: مسؤول فقط عن CameraX + lifecycle
+    private lateinit var cameraManager: CameraManager
+
+    // كاشف الوجه (BlazeFace أو مكافئه)
+    private lateinit var faceDetector: FaceDetector
+
+    // نموذج MobileFaceNet لاستخراج الـ embedding
+    private lateinit var faceNet: MobileFaceNet
+
+    // إرسال حالات النظام (أخطاء، تحذيرات…) للطبقة الأعلى
+    private lateinit var statusReporter: SystemStatusReporter
+
 
     /* =========================================================
-     * Camera
+     * Adaptive system configuration
      * ========================================================= */
 
-    private val cameraExecutor = Executors.newSingleThreadExecutor()
+    /**
+     * هذه القيم تُبنى مرة واحدة عند التشغيل
+     * بناءً على قدرة الجهاز (CPU / RAM).
+     *
+     * لا تُغيّر أثناء التشغيل.
+     */
+    private lateinit var adaptiveConfig: AdaptiveConfig
+
+    /**
+     * يُستخدم لعملية Throttling.
+     * يمنع معالجة كل frame.
+     */
+    private var lastProcessedFrameTime = 0L
+
 
     /* =========================================================
-     * Liveness
+     * Executors
      * ========================================================= */
 
+    /**
+     * Executor مخصص لكل ما هو ثقيل:
+     * - Face detection
+     * - Liveness
+     * - Embedding
+     *
+     * ❗ مهم: لا يتم تشغيل أي ML على Thread الكاميرا.
+     */
+    private val inferenceExecutor =
+        Executors.newSingleThreadExecutor()
+
+
+    /* =========================================================
+     * Liveness system
+     * ========================================================= */
+
+    /**
+     * orchestrator يجمع frames عبر الزمن
+     * ويطبّق السياسة (Blink, Smile, Pose…).
+     */
     private lateinit var livenessOrchestrator: LivenessOrchestrator
-    private lateinit var metricsEngine: FacialMetricsEngine
 
-    private var livenessStartTimeMs = 0L
-    private var livenessWindowMs = 3_000L // افتراضي (يُغيّر من Flutter لاحقًا)
+    /**
+     * محرّك حساب القياسات.
+     * هو المكان الوحيد المسموح له بحساب:
+     * EAR / Pose / Lighting…
+     */
+    private val facialMetricsEngine = FacialMetricsEngine()
+
 
     /* =========================================================
-     * Lifecycle
+     * Flutter bridge (واجهة فقط – بدون منطق)
      * ========================================================= */
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+    private lateinit var methodChannel: MethodChannel
 
-        metricsEngine = FacialMetricsEngine()
 
-        initDefaultLiveness() // Android default
-
-        if (hasCameraPermission()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.CAMERA),
-                100
-            )
-        }
+    companion object {
+        private const val CAMERA_PERMISSION_REQUEST = 101
+        private const val CHANNEL_NAME = "attendify/system"
     }
 
+
     /* =========================================================
-     * Flutter Integration (READY)
+     * Flutter engine setup
      * ========================================================= */
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        channel = MethodChannel(
+        // القناة تُستخدم فقط لإرسال حالات النظام
+        methodChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             CHANNEL_NAME
         )
 
-        /**
-         * لاحقًا Flutter سيفعل:
-         * - إرسال LivenessPolicy
-         * - التحكم بالقيم
-         * - التحكم بالنافذة الزمنية
-         */
-        channel.setMethodCallHandler { call, result ->
-            when (call.method) {
-
-                "updateLivenessPolicy" -> {
-                    val policyMap = call.arguments as Map<String, Any>
-                    updatePolicyFromFlutter(policyMap)
-                    result.success(null)
-                }
-
-                "resetLiveness" -> {
-                    resetLivenessSession()
-                    result.success(null)
-                }
-
-                else -> result.notImplemented()
-            }
+        statusReporter = SystemStatusReporter { status ->
+            methodChannel.invokeMethod(
+                "onSystemStatus",
+                status.name
+            )
         }
     }
 
+
     /* =========================================================
-     * Liveness Setup
+     * Activity lifecycle
      * ========================================================= */
 
-    /**
-     * سياسة افتراضية للعمل Android‑only
-     * (سيتم استبدالها من Flutter لاحقًا)
-     */
-    private fun initDefaultLiveness() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-        val policy = LivenessPolicy(
+        /* -----------------------------------------
+         * (1) تحليل الجهاز والتكيّف معه
+         * ----------------------------------------- */
+
+        val deviceProfile = DeviceProfiler.profile(this)
+        adaptiveConfig = AdaptiveConfigResolver.resolve(deviceProfile)
+
+        Log.d("DeviceProfile", deviceProfile.toString())
+        Log.d("AdaptiveConfig", adaptiveConfig.toString())
+
+        /* -----------------------------------------
+         * (2) تعريف سياسة الـ Liveness
+         * ----------------------------------------- */
+
+        val livenessPolicy = LivenessPolicy(
             requireBlink = true,
             minBlinkCount = 1,
             allowSimultaneousBlink = false,
-            eyeClosedThreshold = 0.21,
+            eyeClosedThreshold = 0.25,
 
-            requireSmile = true,
-            minSmileScore = 0.45,
-            minSmileDurationMs = 300,
+            requireSmile = false,
+            minSmileScore = 0.6,
+            minSmileDurationMs = 400,
 
             requireMouthOpen = false,
-            minMouthOpenFrames = 0,
+            minMouthOpenFrames = 6,
 
-            requireYaw = true,
-            minYawDegrees = 18.0,
+            requireYaw = false,
+            minYawDegrees = 12.0,
+
             requirePitch = false,
-            minPitchDegrees = 0.0,
+            minPitchDegrees = 10.0,
 
-            requirePhotometricResponse = true,
-            luminanceVarianceThreshold = 15.0
+            requirePhotometricResponse = false,
+            luminanceVarianceThreshold = 18.0
         )
 
-        livenessOrchestrator = LivenessOrchestrator(policy)
-        livenessStartTimeMs = System.currentTimeMillis()
+        livenessOrchestrator =
+            LivenessOrchestrator(livenessPolicy)
+
+        /* -----------------------------------------
+         * (3) التحقق من صلاحية الكاميرا
+         * ----------------------------------------- */
+
+        if (hasCameraPermission()) {
+            startCameraPipeline()
+        } else {
+            requestCameraPermission()
+        }
     }
 
-    /**
-     * تحديث السياسة من Flutter
-     */
-    private fun updatePolicyFromFlutter(data: Map<String, Any>) {
-
-        // هنا يمكنك parse القيم القادمة من Flutter
-        // وتحويلها إلى LivenessPolicy
-
-        // مثال فقط:
-        livenessWindowMs = (data["windowMs"] as? Int)?.toLong() ?: 3000L
-
-        livenessOrchestrator.reset()
-        livenessStartTimeMs = System.currentTimeMillis()
-    }
-
-    private fun resetLivenessSession() {
-        livenessOrchestrator.reset()
-        livenessStartTimeMs = System.currentTimeMillis()
-    }
 
     /* =========================================================
-     * CameraX
+     * Camera + Face pipeline
      * ========================================================= */
 
-    private fun startCamera() {
+    private fun startCameraPipeline() {
 
-        val providerFuture = ProcessCameraProvider.getInstance(this)
+        val previewView =
+            findViewById<PreviewView>(R.id.previewView)
 
-        providerFuture.addListener({
+        // إنشاء مكونات الذكاء الاصطناعي
+        faceDetector = FaceDetector(this)
+        faceNet = MobileFaceNet(this)
 
-            val cameraProvider = providerFuture.get()
+        // ربط CameraX بالـ lifecycle
+        cameraManager = CameraManager(
+            context = this,
+            lifecycleOwner = this,
+            statusReporter = statusReporter
+        )
 
-            val analysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(
-                    ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
-                )
-                .build()
+        val analyzer = FrameAnalyzer { imageProxy ->
 
-            analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+            /* -----------------------------------------
+             * Throttling
+             * ----------------------------------------- */
+            if (!shouldProcessFrame()) {
+                RuntimeMetricsCollector.recordDrop()
+                imageProxy.close()
+                return@FrameAnalyzer
+            }
+
+            // تحويل الإطار إلى Bitmap
+            // (مرحلة يمكن تحسينها مستقبلًا بتجاوز Bitmap)
+            val bitmap =
+                ImageConverter.imageProxyToBitmap(imageProxy)
+
+            /* -----------------------------------------
+             * Async ML pipeline
+             * ----------------------------------------- */
+            inferenceExecutor.execute {
+
+                val start = System.currentTimeMillis()
 
                 try {
-                    val now = System.currentTimeMillis()
-
-                    // ===========================
-                    // 1) Extract Face Landmarks
-                    // ===========================
-                    val landmarks = extractFaceLandmarks(imageProxy)
-                        ?: run {
-                            imageProxy.close()
-                            return@setAnalyzer
-                        }
-
-                    // ===========================
-                    // 2) Build Metrics Frame
-                    // ===========================
-                    val frame = metricsEngine.buildFrame(
-                        timestampMs = now,
-
-                        rightEyeEAR = landmarks.rightEyeEAR,
-                        leftEyeEAR = landmarks.leftEyeEAR,
-                        rightEyeClosed =
-                            landmarks.rightEyeEAR < 0.21,
-                        leftEyeClosed =
-                            landmarks.leftEyeEAR < 0.21,
-
-                        mouthAspectRatio = landmarks.mouthAR,
-                        smileScore = landmarks.smileScore,
-                        mouthOpen = landmarks.mouthAR > 0.6,
-
-                        yaw = landmarks.yaw,
-                        pitch = landmarks.pitch,
-                        roll = landmarks.roll,
-
-                        meanLuminance = landmarks.meanLuminance,
-                        luminanceVariance = landmarks.luminanceVariance
-                    )
-
-                    // ===========================
-                    // 3) Liveness ingestion
-                    // ===========================
-                    livenessOrchestrator.onFrame(frame)
-
-                    // ===========================
-                    // 4) Evaluate after window
-                    // ===========================
-                    if (now - livenessStartTimeMs >= livenessWindowMs) {
-
-                        val result =
-                            livenessOrchestrator.evaluate()
-
-                        when (result) {
-
-                            LivenessResult.Alive -> {
-                                notifyFlutter("LIVENESS_OK")
-                                // هنا ننتقل لاحقًا
-                                // إلى Face Matching
-                            }
-
-                            LivenessResult.SpoofDetected -> {
-                                notifyFlutter("LIVENESS_FAILED")
-                                resetLivenessSession()
-                            }
-                        }
+                    /* (1) فحص جودة الإطار */
+                    val frameStatus =
+                        ImageQualityChecker.checkFrame(bitmap)
+                    if (frameStatus != SystemStatus.OK) {
+                        statusReporter.report(frameStatus)
+                        return@execute
                     }
 
+                    /* (2) كشف الوجه */
+                    val detection =
+                        faceDetector.detectBestFace(bitmap)
+                            ?: return@execute
+
+                    /* (3) قص الوجه */
+                    val faceBitmap =
+                        FaceCropper.cropFace(
+                            bitmap,
+                            detection.box
+                        ) ?: return@execute
+
+                    /* (4) فحص حجم الوجه */
+                    val faceStatus =
+                        ImageQualityChecker.checkFaceSize(
+                            faceBitmap.width,
+                            faceBitmap.height,
+                            bitmap.width,
+                            bitmap.height
+                        )
+                    if (faceStatus != SystemStatus.OK) {
+                        statusReporter.report(faceStatus)
+                        return@execute
+                    }
+
+                    /* (5) حساب قياسات الوجه */
+                    val metricsFrame =
+                        facialMetricsEngine
+                            .computeFrameFromBitmap(faceBitmap)
+
+                    /* (6) تمرير القياسات إلى Liveness */
+                    livenessOrchestrator.onFrame(metricsFrame)
+
+                    val livenessResult =
+                        livenessOrchestrator.evaluate()
+
+                    if (livenessResult == LivenessResult.SpoofDetected) {
+                        statusReporter.report(
+                            SystemStatus.SPOOF_DETECTED
+                        )
+                        return@execute
+                    }
+
+                    /* (7) استخراج الـ embedding */
+                    faceNet.getEmbedding(faceBitmap)
+
+                    RuntimeMetricsCollector.recordInference(
+                        System.currentTimeMillis() - start
+                    )
+
                 } catch (ex: Exception) {
-                    Log.e("MainActivity", ex.message ?: "")
-                } finally {
-                    imageProxy.close()
+                    Log.e("Pipeline", "Fatal error", ex)
+                    statusReporter.report(
+                        SystemStatus.INTERNAL_ERROR
+                    )
                 }
             }
 
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
-                this,
-                CameraSelector.DEFAULT_FRONT_CAMERA,
-                analysis
-            )
+            imageProxy.close()
+        }
 
-        }, ContextCompat.getMainExecutor(this))
+        cameraManager.startCamera(
+            preview = previewView.surfaceProvider,
+            analyzer = analyzer
+        )
     }
+
 
     /* =========================================================
-     * Flutter notifications
+     * Frame throttling
      * ========================================================= */
 
-    private fun notifyFlutter(event: String) {
-        if (::channel.isInitialized) {
-            runOnUiThread {
-                channel.invokeMethod("onLivenessEvent", event)
-            }
+    private fun shouldProcessFrame(): Boolean {
+        val now = System.currentTimeMillis()
+        val minInterval =
+            1000 / adaptiveConfig.processingFps
+
+        return if (now - lastProcessedFrameTime >= minInterval) {
+            lastProcessedFrameTime = now
+            true
+        } else {
+            false
         }
     }
+
 
     /* =========================================================
      * Permissions
@@ -291,29 +370,48 @@ class MainActivity : FlutterActivity() {
             Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
 
+    private fun requestCameraPermission() {
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.CAMERA),
+            CAMERA_PERMISSION_REQUEST
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(
+            requestCode,
+            permissions,
+            grantResults
+        )
+
+        if (
+            requestCode == CAMERA_PERMISSION_REQUEST &&
+            grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        ) {
+            startCameraPipeline()
+        } else {
+            statusReporter.report(
+                SystemStatus.NO_CAMERA_PERMISSION
+            )
+        }
+    }
+
+
     /* =========================================================
-     * Landmarks (Placeholder)
+     * Cleanup
      * ========================================================= */
 
-    private fun extractFaceLandmarks(
-        imageProxy: ImageProxy
-    ): FaceLandmarksData? {
-        // TODO: ML Kit / MediaPipe integration
-        return null
+    override fun onDestroy() {
+        super.onDestroy()
+        inferenceExecutor.shutdown()
+        if (::cameraManager.isInitialized) {
+            cameraManager.shutdown()
+        }
     }
 }
-
-/**
- * تمثيل مؤقت للمعالم – استبدله بالمصدر الحقيقي
- */
-data class FaceLandmarksData(
-    val rightEyeEAR: Double,
-    val leftEyeEAR: Double,
-    val mouthAR: Double,
-    val smileScore: Double,
-    val yaw: Double,
-    val pitch: Double,
-    val roll: Double,
-    val meanLuminance: Double,
-    val luminanceVariance: Double
-)

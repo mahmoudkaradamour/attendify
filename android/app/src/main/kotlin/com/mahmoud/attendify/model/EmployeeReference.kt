@@ -16,6 +16,7 @@ data class EmployeeReference(
     /**
      * Embedding الوجه المرجعي (128D غالبًا)
      */
+
     val embedding: FloatArray,
 
     /**
@@ -26,7 +27,7 @@ data class EmployeeReference(
     /**
      * Threshold مخصص للموظف (اختياري)
      */
-    val customThreshold: Float? = null,
+    val customThreshold: Double? = null,
 
     /**
      * معرف المجموعة (اختياري)

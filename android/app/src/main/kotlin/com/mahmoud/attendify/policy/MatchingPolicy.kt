@@ -4,37 +4,36 @@ package com.mahmoud.attendify.policy
  * MatchingPolicy
  *
  * Arabic:
- * يمثل سياسة المطابقة التي تحددها الإدارة.
- * هذه القيم قادمة من Flutter (إعدادات المدير).
+ * سياسة المطابقة المعرفة من قبل الإدارة.
+ * تمثل القواعد العامة التي تحكم:
+ * - العتبة الافتراضية للمطابقة
+ * - سياسة التحقق من المرجع
  *
- * English:
- * Represents face matching policy controlled by admin.
+ * ملاحظة مهمة:
+ * جميع القيم العددية هنا من النوع Double
+ * لتفادي أي تعارض Float / Double عبر النظام.
  */
 data class MatchingPolicy(
 
     /**
-     * Arabic:
-     * سياسة التحقق من الصورة المرجعية:
-     * - لا تحقق
-     * - تحقق مرة واحدة
-     * - تحقق دائم
-     */
-    val referenceValidationPolicy: ReferenceValidationPolicy,
-
-    /**
-     * Arabic:
-     * القيمة الافتراضية لدرجة المطابقة.
-     * تُستخدم إن لم يوجد تخصيص للموظف أو للمجموعة.
+     * defaultThreshold
      *
-     * Example:
-     * 0.55 = مرن
-     * 0.70 = صارم
+     * العتبة الافتراضية للمطابقة (L2 Distance).
+     * تُستخدم إذا لم يكن هناك:
+     * - عتبة خاصة بالموظف
+     * - ولا عتبة خاصة بالمجموعة
+     *
+     * القيمة الأقل = تطابق أقوى
      */
-    val defaultThreshold: Float,
+    val defaultThreshold: Double,
 
     /**
-     * Arabic:
-     * السماح بتخزين البيانات المرجعية محليًا على جهاز الموظف.
+     * referenceValidationPolicy
+     *
+     * سياسة التحقق من جودة الصورة المرجعية:
+     * - NEVER_VALIDATE_AT_ATTENDANCE
+     * - VALIDATE_ONCE_AT_ENROLLMENT
+     * - VALIDATE_EVERY_ATTENDANCE
      */
-    val allowLocalReferenceStorage: Boolean
+    val referenceValidationPolicy: ReferenceValidationPolicy
 )

@@ -9,30 +9,30 @@ import com.mahmoud.attendify.liveness.result.LivenessResult
 /**
  * LivenessOrchestrator
  *
- * Arabic:
- * هذا الكلاس هو المسؤول عن:
+ * المسؤوليات:
  * 1. استقبال القياسات اللحظية (FacialMetricsFrame)
- * 2. تمريرها إلى جميع التحققات (Checks) المُفعّلة
+ * 2. تمريرها إلى Checks المُفعّلة حسب السياسة
  * 3. تسجيل الجلسة كاملة (Audit / Debug)
- * 4. اتخاذ القرار النهائي: حي أم تزوير
+ * 4. اتخاذ القرار النهائي: Alive أو SpoofDetected
  *
- * ملاحظات معمارية:
- * - لا يحتوي أي منطق ML
- * - لا يحتوي UI
- * - كل التحكم يتم عبر LivenessPolicy
+ * خصائص معمارية:
+ * - Temporal (زمني)
+ * - Policy-driven
+ * - Stateless بالنسبة لـ UI
+ * - NO ML
  */
 class LivenessOrchestrator(
     private val policy: LivenessPolicy
 ) {
 
     /* =========================================================
-     * Session logging
+     * Session log (audit)
      * ========================================================= */
 
     private val sessionLog = MetricsSessionLog()
 
     /* =========================================================
-     * Checks initialization (حسب السياسة)
+     * Checks initialization (based on policy)
      * ========================================================= */
 
     private val blinkCheck =
@@ -82,20 +82,14 @@ class LivenessOrchestrator(
         else null
 
     /* =========================================================
-     * Frame ingestion
+     * Frame ingestion (called once per frame)
      * ========================================================= */
 
-    /**
-     * onFrame
-     *
-     * تُستدعى مرة لكل frame بعد بناء FacialMetricsFrame
-     */
     fun onFrame(frame: FacialMetricsFrame) {
 
-        // تسجيل كل frame للجلسة
+        // Audit trail
         sessionLog.add(frame)
 
-        // تمرير frame لكل التحققات المفعّلة
         blinkCheck?.onFrame(frame)
         smileCheck?.onFrame(frame)
         mouthOpenCheck?.onFrame(frame)
@@ -105,14 +99,9 @@ class LivenessOrchestrator(
     }
 
     /* =========================================================
-     * Final evaluation
+     * Final evaluation (called after temporal window)
      * ========================================================= */
 
-    /**
-     * evaluate
-     *
-     * تُستدعى بعد انتهاء نافذة Liveness (زمنية أو منطقية)
-     */
     fun evaluate(): LivenessResult {
 
         if (policy.requireBlink && blinkCheck?.isPassed() != true)
@@ -140,7 +129,7 @@ class LivenessOrchestrator(
     }
 
     /* =========================================================
-     * Session / lifecycle
+     * Lifecycle
      * ========================================================= */
 
     fun getSessionLog(): MetricsSessionLog = sessionLog

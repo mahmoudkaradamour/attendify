@@ -4,23 +4,38 @@ package com.mahmoud.attendify.policy
  * ThresholdResolver
  *
  * Arabic:
- * يحدد درجة المطابقة الفعالة لموظف معيّن.
+ * مسؤول عن تحديد العتبة النهائية للمطابقة
+ * وفق التسلسل التالي (من الأعلى أولوية إلى الأدنى):
  *
- * English:
- * Resolves effective matching threshold.
+ * 1️⃣ عتبة الموظف (Employee specific)
+ * 2️⃣ عتبة المجموعة (Group specific)
+ * 3️⃣ العتبة الافتراضية (System default)
+ *
+ * جميع القيم من النوع Double.
  */
 object ThresholdResolver {
 
     /**
-     * @param employeeThreshold قيمة مخصّصة لموظف (إن وجدت)
-     * @param groupThreshold قيمة مخصّصة لمجموعة (إن وجدت)
-     * @param defaultThreshold القيمة الافتراضية للشركة
+     * resolve
+     *
+     * @param employeeThreshold
+     * عتبة مخصصة لموظف معين (قد تكون null)
+     *
+     * @param groupThreshold
+     * عتبة مخصصة لمجموعة موظفين (قد تكون null)
+     *
+     * @param defaultThreshold
+     * العتبة الافتراضية للنظام (غير null)
+     *
+     * @return Double
+     * العتبة النهائية التي ستُستخدم في المطابقة
      */
     fun resolve(
-        employeeThreshold: Float?,
-        groupThreshold: Float?,
-        defaultThreshold: Float
-    ): Float {
+        employeeThreshold: Double?,
+        groupThreshold: Double?,
+        defaultThreshold: Double
+    ): Double {
+
         return employeeThreshold
             ?: groupThreshold
             ?: defaultThreshold

@@ -35,29 +35,28 @@ class CameraManager(
     /**
      * Executor مخصص لتحليل الصور
      *
-     * Arabic:
-     * نستخدم Thread واحد فقط لتفادي ضغط الذاكرة
-     *
-     * English:
-     * Single-thread executor for image analysis
+     * نستخدم Thread واحد فقط لتفادي:
+     * - ضغط الذاكرة
+     * - تداخل frames
      */
     private val cameraExecutor: ExecutorService =
         Executors.newSingleThreadExecutor()
 
     /**
-     * CameraProvider هو المتحكم الفعلي بالكاميرا
+     * المتحكم الفعلي بالكاميرا (CameraX entry point)
      */
     private var cameraProvider: ProcessCameraProvider? = null
 
     /**
      * startCamera
      *
-     * Arabic:
-     * تشغيل الكاميرا وربطها مع Preview و Analyzer
-     * هذه الدالة لا يجب أن ترمي أي Exception إلى الخارج
+     * مسؤول عن:
+     * - تهيئة CameraX
+     * - ربط Preview
+     * - ربط ImageAnalysis
      *
-     * English:
-     * Starts camera and binds preview & analyzer safely
+     * ⚠️ مهم:
+     * هذه الدالة لا ترمي أي exception للخارج
      */
     fun startCamera(
         preview: Preview.SurfaceProvider,
@@ -74,43 +73,37 @@ class CameraManager(
                 cameraProvider = providerFuture.get()
 
                 /**
-                 * Arabic:
-                 * مهم جدًا: نفصل أي UseCases قديمة
-                 * لتفادي تضارب مع MIUI أو إعادة الدخول للتطبيق
-                 *
-                 * English:
-                 * Always unbind previous use cases
+                 * نفصل أي UseCases سابقة
+                 * (حل مشاكل MIUI / إعادة فتح الكاميرا)
                  */
                 cameraProvider?.unbindAll()
 
-                // ---------- Preview ----------
-                val previewUseCase = Preview.Builder()
-                    .build()
-                    .also {
-                        it.setSurfaceProvider(preview)
-                    }
+                // -------- Preview --------
+                val previewUseCase =
+                    Preview.Builder()
+                        .build()
+                        .also {
+                            it.setSurfaceProvider(preview)
+                        }
 
-                // ---------- Image Analysis ----------
-                val analysisUseCase = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(
-                        ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
-                    )
-                    .build()
-                    .also {
-                        it.setAnalyzer(cameraExecutor, analyzer)
-                    }
+                // -------- Image Analysis --------
+                val analysisUseCase =
+                    ImageAnalysis.Builder()
+                        .setBackpressureStrategy(
+                            ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
+                        )
+                        .build()
+                        .also {
+                            it.setAnalyzer(cameraExecutor, analyzer)
+                        }
 
-                // ---------- Camera Selector ----------
+                // -------- Camera Selector --------
                 val cameraSelector =
                     CameraSelector.DEFAULT_FRONT_CAMERA
 
                 /**
-                 * Arabic:
                  * ربط الكاميرا بدورة حياة الـ Activity
-                 * CameraX سيتكفل بالإيقاف والتشغيل التلقائي
-                 *
-                 * English:
-                 * Bind camera to lifecycle
+                 * CameraX يدير الإيقاف والتشغيل تلقائيًا
                  */
                 cameraProvider?.bindToLifecycle(
                     lifecycleOwner,
@@ -119,40 +112,28 @@ class CameraManager(
                     analysisUseCase
                 )
 
-                // ✅ كل شيء يعمل
+                // ✅ التشغيل ناجح
                 statusReporter.report(SystemStatus.OK)
 
-            } catch (e: SecurityException) {
+            } catch (_: SecurityException) {
                 /**
-                 * Arabic:
-                 * صلاحية الكاميرا سُحبت (يدويًا أو من النظام)
-                 *
-                 * English:
-                 * Camera permission revoked
+                 * صلاحية الكاميرا سُحبت أثناء التشغيل
                  */
                 statusReporter.report(
                     SystemStatus.CAMERA_PERMISSION_REVOKED_BY_SYSTEM
                 )
 
-            } catch (e: IllegalStateException) {
+            } catch (_: IllegalStateException) {
                 /**
-                 * Arabic:
-                 * الكاميرا مشغولة (تطبيق آخر / MIUI / HAL)
-                 *
-                 * English:
-                 * Camera is busy or unavailable
+                 * الكاميرا مشغولة أو غير متاحة
                  */
                 statusReporter.report(
                     SystemStatus.CAMERA_BUSY
                 )
 
-            } catch (e: OutOfMemoryError) {
+            } catch (_: OutOfMemoryError) {
                 /**
-                 * Arabic:
-                 * ضغط ذاكرة عالي – لا نكمل التحليل
-                 *
-                 * English:
-                 * Memory pressure detected
+                 * ضغط ذاكرة مرتفع
                  */
                 statusReporter.report(
                     SystemStatus.LOW_MEMORY
@@ -160,16 +141,12 @@ class CameraManager(
 
             } catch (e: Exception) {
                 /**
-                 * Arabic:
                  * أي خطأ غير متوقع
                  * لا ننهار أبدًا
-                 *
-                 * English:
-                 * Any unexpected internal error
                  */
                 Log.e(
                     "CameraManager",
-                    "Internal camera error",
+                    "Unexpected camera error",
                     e
                 )
                 statusReporter.report(
@@ -183,12 +160,8 @@ class CameraManager(
     /**
      * shutdown
      *
-     * Arabic:
-     * إغلاق الكاميرا بطريقة آمنة
-     * تُستدعى في onDestroy أو عند إيقاف الـ pipeline
-     *
-     * English:
-     * Safely shuts down camera and executor
+     * إغلاق الكاميرا بطريقة آمنة.
+     * تُستدعى من onDestroy أو عند إيقاف الـ pipeline.
      */
     fun shutdown() {
         try {
@@ -199,13 +172,9 @@ class CameraManager(
                 SystemStatus.CAMERA_CLOSED
             )
 
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             /**
-             * Arabic:
              * حتى أثناء الإغلاق لا نسمح بحدوث crash
-             *
-             * English:
-             * Shutdown must never crash
              */
             statusReporter.report(
                 SystemStatus.INTERNAL_ERROR

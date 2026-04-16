@@ -1,47 +1,46 @@
 package com.mahmoud.attendify.matching
 
-import com.mahmoud.attendify.model.EmployeeReference
 import com.mahmoud.attendify.policy.MatchingPolicy
-import com.mahmoud.attendify.policy.ReferenceValidationPolicy
+import com.mahmoud.attendify.policy.ReferenceAccessPolicy
+import com.mahmoud.attendify.repository.EmployeeReferenceRepository
 
 /**
  * FaceMatchingUseCase
  *
- * Arabic:
- * طبقة وسيطة تُستخدم من:
+ * طبقة استعمال (Application Layer).
+ * تُستدعى من:
  * - MainActivity
+ * - Service
  * - MethodChannel
- * - أي Service مستقبلي
- *
- * هي التي تنشئ orchestrator وتنفذ المطابقة.
- *
- * English:
- * Application-level use case for face matching.
  */
 class FaceMatchingUseCase(
     private val policy: MatchingPolicy,
-    private val groupThreshold: Float?
+    private val referenceAccessPolicy: ReferenceAccessPolicy,
+    private val repository: EmployeeReferenceRepository,
+    private val groupThreshold: Double?
 ) {
 
     private val orchestrator =
-        FaceMatchingOrchestrator(policy)
+        FaceMatchingOrchestrator(
+            policy = policy,
+            referenceAccessPolicy = referenceAccessPolicy,
+            repository = repository
+        )
 
     /**
      * matchNow
      *
-     * @param liveEmbedding embedding مستخرج من صورة الكاميرا
-     * @param reference بيانات الموظف المرجعية
-     *
-     * @return MatchDecision قرار واضح يمكن عرضه للواجهة
+     * @param liveEmbedding embedding من الكاميرا
+     * @param employeeId معرف الموظف (نبحث به عن المرجع)
      */
     fun matchNow(
         liveEmbedding: FloatArray,
-        reference: EmployeeReference
+        employeeId: String
     ): MatchDecision {
 
         return orchestrator.performMatch(
             liveEmbedding = liveEmbedding,
-            reference = reference,
+            employeeId = employeeId,
             groupThreshold = groupThreshold
         )
     }
