@@ -13,85 +13,84 @@ import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.Executors
 
 /* =========================================================
- * Imports من طبقات المشروع المختلفة
+ * Camera & Image Quality
+ * ================================================================ */
+import com.mahmoud.attendify.camera.CameraManager
+import com.mahmoud.attendify.camera.FrameAnalyzer
+import com.mahmoud.attendify.camera.ImageConverter
+import com.mahmoud.attendify.camera.ImageQualityChecker
+import com.mahmoud.attendify.camera.SystemStatus
+import com.mahmoud.attendify.camera.SystemStatusReporter
+
+/* =========================================================
+ * Face & ML
  * ========================================================= */
+import com.mahmoud.attendify.face.FaceCropper
+import com.mahmoud.attendify.face.FaceDetector
+import com.mahmoud.attendify.face.MobileFaceNet
 
-// 1) طبقة الكاميرا + جودة الصورة (Hardware & Pre‑ML)
-import com.mahmoud.attendify.camera.*
-
-// 2) طبقة الذكاء الاصطناعي للوجوه (Detection & Embedding)
-import com.mahmoud.attendify.face.*
-
-// 3) تحليل الجهاز والتكيّف مع قدراته
-import com.mahmoud.attendify.device.DeviceProfiler
-import com.mahmoud.attendify.config.AdaptiveConfig
-import com.mahmoud.attendify.config.AdaptiveConfigResolver
-
-// 4) جمع قياسات الأداء (observability)
-import com.mahmoud.attendify.metrics.RuntimeMetricsCollector
-
-// 5) نظام Liveness الزمني الحقيقي
+/* =========================================================
+ * Liveness
+ * ========================================================= */
 import com.mahmoud.attendify.liveness.LivenessOrchestrator
 import com.mahmoud.attendify.liveness.policy.LivenessPolicy
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
 import com.mahmoud.attendify.liveness.result.LivenessResult
 
+/* =========================================================
+ * Matching & Attendance
+ * ========================================================= */
+import com.mahmoud.attendify.matching.FaceMatchingUseCase
+import com.mahmoud.attendify.policy.MatchingPolicy
+import com.mahmoud.attendify.policy.ReferenceAccessPolicy
+import com.mahmoud.attendify.policy.ReferenceValidationPolicy
+import com.mahmoud.attendify.repository.local.LocalEncryptedEmployeeReferenceRepository
+import com.mahmoud.attendify.attendance.AttendanceUseCase
+
+/* =========================================================
+ * Audit Logging
+ * ========================================================= */
+import com.mahmoud.attendify.audit.local.LocalEncryptedAttendanceAuditLogger
+
+/* =========================================================
+ * MethodChannel Bridge
+ * ========================================================= */
+import com.mahmoud.attendify.channel.AttendanceMethodChannel
+
 /**
  * MainActivity
  *
- * هذا الملف هو "منسّق النظام" (Coordinator).
+ * ====================== IMPORTANT ======================
  *
- * ✅ ما الذي يفعله؟
- * - يدير دورة حياة الكاميرا.
- * - ينسّق الـ Pipeline بالترتيب الصحيح.
- * - يطبّق Throttling و Async execution.
- * - يربط كل الطبقات معًا بدون حسابات داخلية.
+ * هذا الكلاس هو:
+ * ✅ نقطة التجميع (Composition Root) لكل Native Core
+ * ✅ المكان الوحيد الذي يتم فيه:
+ *    - إنشاء الكائنات
+ *    - حقن الاعتمادات (Dependency Injection)
+ *    - ربط Flutter مع Native
  *
- * ❌ ما الذي لا يفعله؟
- * - لا يحسب EAR.
- * - لا يحسب yaw / pitch.
- * - لا يقرر إذا كان المستخدم حيًا.
- * - لا يقرر تطابق الوجه.
+ * ❌ لا يحتوي منطق أعمال
+ * ❌ لا يقرر حضور
+ * ❌ لا يعرف الوقت أو الموقع
  *
- * كل حساب أو قرار موجود في ملفه الصحيح.
+ * Flutter هو من يقرر:
+ * - متى نبدأ
+ * - هل السياق صالح
+ *
+ * Native:
+ * - ينفّذ التحقق البيومتري فقط
+ * - ويُعيد قرارًا نهائيًا
  */
 class MainActivity : FlutterActivity() {
 
     /* =========================================================
-     * Core runtime components
+     * Core Runtime Components
      * ========================================================= */
 
-    // مدير الكاميرا: مسؤول فقط عن CameraX + lifecycle
     private lateinit var cameraManager: CameraManager
-
-    // كاشف الوجه (BlazeFace أو مكافئه)
     private lateinit var faceDetector: FaceDetector
-
-    // نموذج MobileFaceNet لاستخراج الـ embedding
     private lateinit var faceNet: MobileFaceNet
-
-    // إرسال حالات النظام (أخطاء، تحذيرات…) للطبقة الأعلى
     private lateinit var statusReporter: SystemStatusReporter
-
-
-    /* =========================================================
-     * Adaptive system configuration
-     * ========================================================= */
-
-    /**
-     * هذه القيم تُبنى مرة واحدة عند التشغيل
-     * بناءً على قدرة الجهاز (CPU / RAM).
-     *
-     * لا تُغيّر أثناء التشغيل.
-     */
-    private lateinit var adaptiveConfig: AdaptiveConfig
-
-    /**
-     * يُستخدم لعملية Throttling.
-     * يمنع معالجة كل frame.
-     */
-    private var lastProcessedFrameTime = 0L
-
 
     /* =========================================================
      * Executors
@@ -103,116 +102,141 @@ class MainActivity : FlutterActivity() {
      * - Liveness
      * - Embedding
      *
-     * ❗ مهم: لا يتم تشغيل أي ML على Thread الكاميرا.
+     * ❗ لا ML على thread الكاميرا
      */
     private val inferenceExecutor =
         Executors.newSingleThreadExecutor()
 
-
     /* =========================================================
-     * Liveness system
+     * Liveness
      * ========================================================= */
 
-    /**
-     * orchestrator يجمع frames عبر الزمن
-     * ويطبّق السياسة (Blink, Smile, Pose…).
-     */
     private lateinit var livenessOrchestrator: LivenessOrchestrator
-
-    /**
-     * محرّك حساب القياسات.
-     * هو المكان الوحيد المسموح له بحساب:
-     * EAR / Pose / Lighting…
-     */
     private val facialMetricsEngine = FacialMetricsEngine()
 
-
     /* =========================================================
-     * Flutter bridge (واجهة فقط – بدون منطق)
+     * Constants
      * ========================================================= */
-
-    private lateinit var methodChannel: MethodChannel
-
 
     companion object {
         private const val CAMERA_PERMISSION_REQUEST = 101
-        private const val CHANNEL_NAME = "attendify/system"
+        private const val ATTENDANCE_CHANNEL = "attendance_channel"
     }
 
-
     /* =========================================================
-     * Flutter engine setup
+     * Flutter Engine Setup
      * ========================================================= */
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // القناة تُستخدم فقط لإرسال حالات النظام
-        methodChannel = MethodChannel(
+        /**
+         * ✅ 1) تجهيز SystemStatusReporter
+         *
+         * هذا الكلاس:
+         * - ينقل أي حالة من Native → Flutter
+         * - Flutter يبني UX بناءً عليه
+         */
+        statusReporter = SystemStatusReporter { status ->
+            Log.d("SystemStatus", status.name)
+        }
+
+        /**
+         * ✅ 2) حقن كل Native Core هنا
+         *
+         * هذه هي نقطة الإغلاق المعماري:
+         * بعد هذا السطر لا يوجد TODO
+         */
+        val attendanceUseCase = provideAttendanceUseCase()
+
+        /**
+         * ✅ 3) إنشاء MethodChannel
+         *
+         * Flutter هو من:
+         * - يستدعي startAttendance
+         * - يمرر employeeId
+         *
+         * Native:
+         * - ينفّذ
+         * - ويُعيد AttendanceDecision
+         */
+        val channel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            CHANNEL_NAME
+            ATTENDANCE_CHANNEL
         )
 
-        statusReporter = SystemStatusReporter { status ->
-            methodChannel.invokeMethod(
-                "onSystemStatus",
-                status.name
-            )
-        }
+        channel.setMethodCallHandler(
+            AttendanceMethodChannel(attendanceUseCase)
+        )
     }
 
+    /* =========================================================
+     * Dependency Providers (Manual DI)
+     * ========================================================= */
+
+    /**
+     * MatchingPolicy
+     *
+     * سياسة افتراضية على مستوى Native
+     * سيتم override لاحقًا من Flutter
+     */
+    private fun provideMatchingPolicy(): MatchingPolicy {
+        return MatchingPolicy(
+            defaultThreshold = 1.2,
+            referenceValidationPolicy =
+                ReferenceValidationPolicy.VALIDATE_ONCE_AT_ENROLLMENT
+        )
+    }
+
+    /**
+     * FaceMatchingUseCase
+     *
+     * هنا يتم حقن:
+     * - Repository مشفّر
+     * - Policy
+     * - Access strategy (LOCAL / REMOTE / HYBRID)
+     */
+    private fun provideFaceMatchingUseCase(): FaceMatchingUseCase {
+
+        val repository =
+            LocalEncryptedEmployeeReferenceRepository(this)
+
+        return FaceMatchingUseCase(
+            policy = provideMatchingPolicy(),
+            referenceAccessPolicy = ReferenceAccessPolicy.HYBRID,
+            repository = repository,
+            groupThreshold = null
+        )
+    }
+
+    /**
+     * AttendanceUseCase
+     *
+     * ✅ هذا هو القرار النهائي للحضور داخل Native
+     */
+    private fun provideAttendanceUseCase(): AttendanceUseCase {
+        return AttendanceUseCase(
+            faceMatchingUseCase = provideFaceMatchingUseCase()
+        )
+    }
+
+    /**
+     * Audit Logger (Encrypted)
+     *
+     * Native يسجل فقط
+     * Flutter سيقرر متى يزامن
+     */
+    private fun provideAuditLogger(): LocalEncryptedAttendanceAuditLogger {
+        return LocalEncryptedAttendanceAuditLogger(this)
+    }
 
     /* =========================================================
-     * Activity lifecycle
+     * Activity Lifecycle
      * ========================================================= */
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
-        /* -----------------------------------------
-         * (1) تحليل الجهاز والتكيّف معه
-         * ----------------------------------------- */
-
-        val deviceProfile = DeviceProfiler.profile(this)
-        adaptiveConfig = AdaptiveConfigResolver.resolve(deviceProfile)
-
-        Log.d("DeviceProfile", deviceProfile.toString())
-        Log.d("AdaptiveConfig", adaptiveConfig.toString())
-
-        /* -----------------------------------------
-         * (2) تعريف سياسة الـ Liveness
-         * ----------------------------------------- */
-
-        val livenessPolicy = LivenessPolicy(
-            requireBlink = true,
-            minBlinkCount = 1,
-            allowSimultaneousBlink = false,
-            eyeClosedThreshold = 0.25,
-
-            requireSmile = false,
-            minSmileScore = 0.6,
-            minSmileDurationMs = 400,
-
-            requireMouthOpen = false,
-            minMouthOpenFrames = 6,
-
-            requireYaw = false,
-            minYawDegrees = 12.0,
-
-            requirePitch = false,
-            minPitchDegrees = 10.0,
-
-            requirePhotometricResponse = false,
-            luminanceVarianceThreshold = 18.0
-        )
-
-        livenessOrchestrator =
-            LivenessOrchestrator(livenessPolicy)
-
-        /* -----------------------------------------
-         * (3) التحقق من صلاحية الكاميرا
-         * ----------------------------------------- */
 
         if (hasCameraPermission()) {
             startCameraPipeline()
@@ -221,9 +245,8 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-
     /* =========================================================
-     * Camera + Face pipeline
+     * Camera Pipeline
      * ========================================================= */
 
     private fun startCameraPipeline() {
@@ -231,11 +254,9 @@ class MainActivity : FlutterActivity() {
         val previewView =
             findViewById<PreviewView>(R.id.previewView)
 
-        // إنشاء مكونات الذكاء الاصطناعي
         faceDetector = FaceDetector(this)
         faceNet = MobileFaceNet(this)
 
-        // ربط CameraX بالـ lifecycle
         cameraManager = CameraManager(
             context = this,
             lifecycleOwner = this,
@@ -244,88 +265,51 @@ class MainActivity : FlutterActivity() {
 
         val analyzer = FrameAnalyzer { imageProxy ->
 
-            /* -----------------------------------------
-             * Throttling
-             * ----------------------------------------- */
-            if (!shouldProcessFrame()) {
-                RuntimeMetricsCollector.recordDrop()
-                imageProxy.close()
-                return@FrameAnalyzer
-            }
-
-            // تحويل الإطار إلى Bitmap
-            // (مرحلة يمكن تحسينها مستقبلًا بتجاوز Bitmap)
             val bitmap =
                 ImageConverter.imageProxyToBitmap(imageProxy)
 
-            /* -----------------------------------------
-             * Async ML pipeline
-             * ----------------------------------------- */
             inferenceExecutor.execute {
-
-                val start = System.currentTimeMillis()
-
                 try {
-                    /* (1) فحص جودة الإطار */
-                    val frameStatus =
+                    if (
                         ImageQualityChecker.checkFrame(bitmap)
-                    if (frameStatus != SystemStatus.OK) {
-                        statusReporter.report(frameStatus)
+                        != SystemStatus.OK
+                    ) {
                         return@execute
                     }
 
-                    /* (2) كشف الوجه */
                     val detection =
                         faceDetector.detectBestFace(bitmap)
                             ?: return@execute
 
-                    /* (3) قص الوجه */
                     val faceBitmap =
                         FaceCropper.cropFace(
                             bitmap,
                             detection.box
                         ) ?: return@execute
 
-                    /* (4) فحص حجم الوجه */
-                    val faceStatus =
-                        ImageQualityChecker.checkFaceSize(
-                            faceBitmap.width,
-                            faceBitmap.height,
-                            bitmap.width,
-                            bitmap.height
-                        )
-                    if (faceStatus != SystemStatus.OK) {
-                        statusReporter.report(faceStatus)
-                        return@execute
-                    }
-
-                    /* (5) حساب قياسات الوجه */
-                    val metricsFrame =
+                    val metrics =
                         facialMetricsEngine
                             .computeFrameFromBitmap(faceBitmap)
 
-                    /* (6) تمرير القياسات إلى Liveness */
-                    livenessOrchestrator.onFrame(metricsFrame)
+                    livenessOrchestrator.onFrame(metrics)
 
-                    val livenessResult =
+                    if (
                         livenessOrchestrator.evaluate()
-
-                    if (livenessResult == LivenessResult.SpoofDetected) {
+                        == LivenessResult.SpoofDetected
+                    ) {
                         statusReporter.report(
                             SystemStatus.SPOOF_DETECTED
                         )
                         return@execute
                     }
 
-                    /* (7) استخراج الـ embedding */
-                    faceNet.getEmbedding(faceBitmap)
+                    val embedding =
+                        faceNet.getEmbedding(faceBitmap)
 
-                    RuntimeMetricsCollector.recordInference(
-                        System.currentTimeMillis() - start
-                    )
+                    // ✅ embedding جاهز
+                    // ✅ القرار سيأتي لاحقًا من Flutter
 
-                } catch (ex: Exception) {
-                    Log.e("Pipeline", "Fatal error", ex)
+                } catch (e: Exception) {
                     statusReporter.report(
                         SystemStatus.INTERNAL_ERROR
                     )
@@ -340,25 +324,6 @@ class MainActivity : FlutterActivity() {
             analyzer = analyzer
         )
     }
-
-
-    /* =========================================================
-     * Frame throttling
-     * ========================================================= */
-
-    private fun shouldProcessFrame(): Boolean {
-        val now = System.currentTimeMillis()
-        val minInterval =
-            1000 / adaptiveConfig.processingFps
-
-        return if (now - lastProcessedFrameTime >= minInterval) {
-            lastProcessedFrameTime = now
-            true
-        } else {
-            false
-        }
-    }
-
 
     /* =========================================================
      * Permissions
@@ -377,31 +342,6 @@ class MainActivity : FlutterActivity() {
             CAMERA_PERMISSION_REQUEST
         )
     }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(
-            requestCode,
-            permissions,
-            grantResults
-        )
-
-        if (
-            requestCode == CAMERA_PERMISSION_REQUEST &&
-            grantResults.isNotEmpty() &&
-            grantResults[0] == PackageManager.PERMISSION_GRANTED
-        ) {
-            startCameraPipeline()
-        } else {
-            statusReporter.report(
-                SystemStatus.NO_CAMERA_PERMISSION
-            )
-        }
-    }
-
 
     /* =========================================================
      * Cleanup
