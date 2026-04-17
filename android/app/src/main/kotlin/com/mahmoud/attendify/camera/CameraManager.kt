@@ -166,19 +166,10 @@ class CameraManager(
     fun shutdown() {
         try {
             cameraProvider?.unbindAll()
-            cameraExecutor.shutdown()
-
-            statusReporter.report(
-                SystemStatus.CAMERA_CLOSED
-            )
-
-        } catch (_: Exception) {
-            /**
-             * حتى أثناء الإغلاق لا نسمح بحدوث crash
-             */
-            statusReporter.report(
-                SystemStatus.INTERNAL_ERROR
-            )
+            cameraExecutor.shutdownNow() // 🔴 مهم جدًا
+            statusReporter.report(SystemStatus.CAMERA_CLOSED)
+        } catch (e: Exception) {
+            statusReporter.report(SystemStatus.INTERNAL_ERROR)
         }
     }
 }

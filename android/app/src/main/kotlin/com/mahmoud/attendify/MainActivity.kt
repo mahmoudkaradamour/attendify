@@ -12,6 +12,11 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.Executors
 
+import com.mahmoud.attendify.ml.InterpreterFactory
+import com.mahmoud.attendify.ml.GpuPolicy
+import com.mahmoud.attendify.ml.GpuStatus
+import com.mahmoud.attendify.ml.InterpreterCapabilities
+
 /* =========================================================
  * Camera & Image Quality
  * ================================================================ */
@@ -86,7 +91,7 @@ class MainActivity : FlutterActivity() {
     /* =========================================================
      * Core Runtime Components
      * ========================================================= */
-
+    private lateinit var interpreterFactory: InterpreterFactory
     private lateinit var cameraManager: CameraManager
     private lateinit var faceDetector: FaceDetector
     private lateinit var faceNet: MobileFaceNet
@@ -148,6 +153,9 @@ class MainActivity : FlutterActivity() {
          * بعد هذا السطر لا يوجد TODO
          */
         val attendanceUseCase = provideAttendanceUseCase()
+
+        val gpuPolicy = GpuPolicy.USER_CHOICE
+        val userPrefersGpu = true
 
         /**
          * ✅ 3) إنشاء MethodChannel

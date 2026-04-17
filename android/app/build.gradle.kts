@@ -88,31 +88,36 @@ flutter {
     source = "../.."
 }
 dependencies {
+
     implementation("androidx.appcompat:appcompat:1.6.1")
-    // ✅ TensorFlow Lite Core
+
+    /* =========================================================
+     * TensorFlow Lite (Core + GPU)
+     * ========================================================= */
+
+    // ✅ TensorFlow Lite Core (الأساس)
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
 
-    // ✅ Optimized CPU kernels (مهم جدًا للأجهزة الضعيفة)
-    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.14.0")
-
-    // ✅ Optional: GPU delegate (لن نستخدمه افتراضيًا)
+    // ✅ TensorFlow Lite GPU Delegate (اختياري – سنستخدمه بسياسة)
     implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
 
-    // Camera
+    // ✅ TensorFlow Lite Support (مفيد للـ utils والـ metadata)
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+
+
+    /* =========================================================
+     * CameraX
+     * ========================================================= */
+
     implementation("androidx.camera:camera-core:1.3.2")
     implementation("androidx.camera:camera-camera2:1.3.2")
     implementation("androidx.camera:camera-lifecycle:1.3.2")
-
-    // CameraX Preview (للمستقبل)
     implementation("androidx.camera:camera-view:1.3.2")
 
+
+    /* =========================================================
+     * Security
+     * ========================================================= */
+
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
-
-
-
-
-
-
-
-
 }
