@@ -1,5 +1,5 @@
 package com.mahmoud.attendify.ml
-//final1
+//final
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
