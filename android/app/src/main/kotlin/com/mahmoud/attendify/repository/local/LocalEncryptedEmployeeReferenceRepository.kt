@@ -43,7 +43,8 @@ class LocalEncryptedEmployeeReferenceRepository(
         )
     }
 
-    override fun saveLocalReference(reference: EmployeeReference) {
+    override
+    fun saveLocalReference(reference: EmployeeReference) {
         val buffer = ByteBuffer.allocate(reference.embedding.size * 4)
         buffer.asFloatBuffer().put(reference.embedding)
 

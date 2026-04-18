@@ -1,20 +1,18 @@
 package com.mahmoud.attendify.channel
 
+import android.graphics.Bitmap
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import com.mahmoud.attendify.attendance.AttendanceUseCase
 import com.mahmoud.attendify.attendance.AttendanceDecision
-import com.mahmoud.attendify.matching.MatchDecision
-
+import com.mahmoud.attendify.attendance.RejectionReason
+import com.mahmoud.attendify.attendance.AttendanceSession
 /**
  * AttendanceMethodChannel
  *
- * مسؤول عن:
- * - استقبال أوامر Flutter
- * - استدعاء AttendanceUseCase
- * - إعادة النتيجة بشكل بسيط
- *
- * لا يحتوي أي منطق أعمال.
+ * ✅ جسر الاتصال بين Flutter و Native
+ * ✅ لا يحتوي أي منطق أعمال
+ * ✅ يحول البيانات فقط
  */
 class AttendanceMethodChannel(
     private val attendanceUseCase: AttendanceUseCase
@@ -31,7 +29,6 @@ class AttendanceMethodChannel(
             }
 
             "cancelAttendance" -> {
-                // حاليًا لا يوجد State طويل
                 result.success(true)
             }
 
@@ -41,6 +38,15 @@ class AttendanceMethodChannel(
         }
     }
 
+    /**
+     * startAttendance
+     *
+     * في هذه المرحلة:
+     * - Flutter يمرر employeeId + embedding
+     * - Native يملك الصورة (faceBitmap) من Pipeline
+     *
+     * 📌 ربط السياسات و الصورة سيتم لاحقًا من Flutter
+     */
     private fun handleStartAttendance(
         call: MethodCall,
         result: MethodChannel.Result
@@ -62,11 +68,37 @@ class AttendanceMethodChannel(
                 embedding[it].toFloat()
             }
 
+            /**
+             * 🔴 ملاحظة مهمة:
+             * - faceBitmap يأتي من Native Pipeline
+             * - في هذه المرحلة نمرّر Bitmap وهمي
+             *
+             * ➜ هذا مؤقت
+             * ➜ سيتم استبداله عند ربط Flutter بالـ Camera session
+             */
+            val faceBitmap =
+                AttendanceSession.consumeFace()
+                    ?: run {
+                        result.error(
+                            "NO_FACE",
+                            "No valid face captured yet",
+                            null
+                        )
+                        return
+                    }
+
+
             val decision =
                 attendanceUseCase.attemptAttendance(
+                    faceBitmap = faceBitmap,
                     liveEmbedding = floatEmbedding,
-                    employeeId = employeeId
+                    employeeId = employeeId,
+
+                    employeePolicy = null,
+                    groupPolicy = null,
+                    orgPolicy = null
                 )
+
 
             result.success(serializeDecision(decision))
 
@@ -79,6 +111,9 @@ class AttendanceMethodChannel(
         }
     }
 
+    /**
+     * تحويل AttendanceDecision إلى Map بسيط لFlutter
+     */
     private fun serializeDecision(
         decision: AttendanceDecision
     ): Map<String, Any> {
@@ -91,15 +126,19 @@ class AttendanceMethodChannel(
                 )
 
             is AttendanceDecision.AttendanceRejected -> {
-                val reason = decision.reason
-                when (reason) {
-                    is MatchDecision.MatchSuccess ->
-                        mapOf("status" to "RECORDED")
+                when (val reason = decision.reason) {
 
-                    else ->
+                    is RejectionReason.FASRejected ->
                         mapOf(
                             "status" to "REJECTED",
-                            "reason" to reason::class.simpleName!!
+                            "reason" to "FAS",
+                            "message" to reason.reason
+                        )
+
+                    is RejectionReason.FaceMismatch ->
+                        mapOf(
+                            "status" to "REJECTED",
+                            "reason" to "NO_MATCH"
                         )
                 }
             }

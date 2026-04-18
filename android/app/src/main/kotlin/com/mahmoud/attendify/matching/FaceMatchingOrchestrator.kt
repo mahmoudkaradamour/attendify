@@ -131,29 +131,36 @@ class FaceMatchingOrchestrator(
      * REMOTE_ONLY → السيرفر فقط (تحكم مركزي صارم)
      * HYBRID      → محاولة محليًا، ثم السيرفر
      */
+
     private fun resolveReference(
         employeeId: String
     ): Pair<EmployeeReference, ReferenceSource>? {
 
         return when (referenceAccessPolicy) {
 
-            ReferenceAccessPolicy.LOCAL_ONLY ->
-                repository
-                    .getLocalReference(employeeId)
-                    ?.let { it to ReferenceSource.LOCAL_ENCRYPTED }
+            ReferenceAccessPolicy.LOCAL_ONLY -> {
+                repository.getLocalReference(employeeId)
+                    ?.let { reference ->
+                        reference to ReferenceSource.LOCAL_ENCRYPTED
+                    }
+            }
 
-            ReferenceAccessPolicy.REMOTE_ONLY ->
-                repository
-                    .getRemoteReference(employeeId)
-                    ?.let { it to ReferenceSource.REMOTE_SERVER }
+            ReferenceAccessPolicy.REMOTE_ONLY -> {
+                repository.getRemoteReference(employeeId)
+                    ?.let { reference ->
+                        reference to ReferenceSource.REMOTE_SERVER
+                    }
+            }
 
-            ReferenceAccessPolicy.HYBRID ->
-                repository
-                    .getLocalReference(employeeId)
-                    ?.let { it to ReferenceSource.LOCAL_ENCRYPTED }
-                    ?: repository
-                        .getRemoteReference(employeeId)
-                        ?.let { it to ReferenceSource.REMOTE_SERVER }
+            ReferenceAccessPolicy.HYBRID -> {
+                repository.getLocalReference(employeeId)
+                    ?.let { reference ->
+                        reference to ReferenceSource.LOCAL_ENCRYPTED
+                    }
+                    ?: repository.getRemoteReference(employeeId)
+                        ?.let { reference ->
+                            reference to ReferenceSource.REMOTE_SERVER
+                        }
+            }
         }
-    }
-}
+    }}

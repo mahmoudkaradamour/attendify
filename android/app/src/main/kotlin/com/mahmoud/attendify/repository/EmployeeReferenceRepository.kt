@@ -1,13 +1,42 @@
-
 package com.mahmoud.attendify.repository
 
 import com.mahmoud.attendify.model.EmployeeReference
 
+/**
+ * EmployeeReferenceRepository
+ *
+ * ✅ عقد موحّد للوصول إلى المراجع البيومترية
+ * ✅ يدعم Local و Remote (مستقبلاً)
+ * ✅ يُستخدم من Matching layer فقط
+ */
 interface EmployeeReferenceRepository {
 
-    fun getLocalReference(employeeId: String): EmployeeReference?
+    /**
+     * قراءة مرجع مخزن محليًا
+     */
+    fun getLocalReference(
+        employeeId: String
+    ): EmployeeReference?
 
-    fun saveLocalReference(reference: EmployeeReference)
+    /**
+     * حفظ / تحديث مرجع محلي
+     */
+    fun saveLocalReference(
+        reference: EmployeeReference
+    )
 
-    fun clearLocalReference(employeeId: String)
+    /**
+     * حذف مرجع محلي
+     */
+    fun clearLocalReference(
+        employeeId: String
+    )
+
+    /**
+     * ⚠️ Remote غير منفذ بعد
+     * وُضع للعقد المستقبلي (HYBRID / REMOTE)
+     */
+    fun getRemoteReference(
+        employeeId: String
+    ): EmployeeReference? = null
 }

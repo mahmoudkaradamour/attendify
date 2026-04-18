@@ -1,5 +1,8 @@
 package com.mahmoud.attendify
 
+/* 22=========================================================
+ * Android & Flutter
+ * ========================================================= */
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -11,7 +14,10 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.Executors
-
+import com.mahmoud.attendify.attendance.AttendanceSession
+/* =========================================================
+ * ML Runtime (CPU / GPU)
+ * ========================================================= */
 import com.mahmoud.attendify.ml.InterpreterFactory
 import com.mahmoud.attendify.ml.GpuPolicy
 import com.mahmoud.attendify.ml.GpuStatus
@@ -19,7 +25,7 @@ import com.mahmoud.attendify.ml.InterpreterCapabilities
 
 /* =========================================================
  * Camera & Image Quality
- * ================================================================ */
+ * ========================================================= */
 import com.mahmoud.attendify.camera.CameraManager
 import com.mahmoud.attendify.camera.FrameAnalyzer
 import com.mahmoud.attendify.camera.ImageConverter
@@ -28,27 +34,30 @@ import com.mahmoud.attendify.camera.SystemStatus
 import com.mahmoud.attendify.camera.SystemStatusReporter
 
 /* =========================================================
- * Face & ML
+ * Face & Feature Extraction
  * ========================================================= */
 import com.mahmoud.attendify.face.FaceCropper
 import com.mahmoud.attendify.face.FaceDetector
 import com.mahmoud.attendify.face.MobileFaceNet
 
 /* =========================================================
- * Liveness
+ * Passive / Active Liveness
  * ========================================================= */
 import com.mahmoud.attendify.liveness.LivenessOrchestrator
-import com.mahmoud.attendify.liveness.policy.LivenessPolicy
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
 import com.mahmoud.attendify.liveness.result.LivenessResult
+
+/* =========================================================
+ * Face Anti-Spoofing (FAS)
+ * ========================================================= */
+import com.mahmoud.attendify.fas.models.MiniFASNetV2Model
+import com.mahmoud.attendify.fas.runtime.FASOrchestrator
 
 /* =========================================================
  * Matching & Attendance
  * ========================================================= */
 import com.mahmoud.attendify.matching.FaceMatchingUseCase
-import com.mahmoud.attendify.policy.MatchingPolicy
-import com.mahmoud.attendify.policy.ReferenceAccessPolicy
-import com.mahmoud.attendify.policy.ReferenceValidationPolicy
+import com.mahmoud.attendify.policy.*
 import com.mahmoud.attendify.repository.local.LocalEncryptedEmployeeReferenceRepository
 import com.mahmoud.attendify.attendance.AttendanceUseCase
 
@@ -61,37 +70,32 @@ import com.mahmoud.attendify.audit.local.LocalEncryptedAttendanceAuditLogger
  * MethodChannel Bridge
  * ========================================================= */
 import com.mahmoud.attendify.channel.AttendanceMethodChannel
+import com.mahmoud.attendify.fas.models.FastFASNetV3Model
+import com.mahmoud.attendify.fas.models.MiniFASNetV1SEModel
 
 /**
  * MainActivity
  *
- * ====================== IMPORTANT ======================
- *
  * هذا الكلاس هو:
- * ✅ نقطة التجميع (Composition Root) لكل Native Core
- * ✅ المكان الوحيد الذي يتم فيه:
- *    - إنشاء الكائنات
- *    - حقن الاعتمادات (Dependency Injection)
- *    - ربط Flutter مع Native
+ * ✅ نقطة التجميع الوحيدة (Composition Root)
+ * ✅ المكان الوحيد لإنشاء وربط كل Native Core
  *
  * ❌ لا يحتوي منطق أعمال
- * ❌ لا يقرر حضور
- * ❌ لا يعرف الوقت أو الموقع
+ * ❌ لا يقرر نجاح أو فشل حضور
  *
- * Flutter هو من يقرر:
- * - متى نبدأ
- * - هل السياق صالح
+ * Flutter:
+ * - يحدد السياق
+ * - يرسل السياسات
  *
  * Native:
- * - ينفّذ التحقق البيومتري فقط
- * - ويُعيد قرارًا نهائيًا
+ * - ينفذ
+ * - ويرجع قرارًا نهائيًا
  */
 class MainActivity : FlutterActivity() {
 
     /* =========================================================
      * Core Runtime Components
      * ========================================================= */
-    private lateinit var interpreterFactory: InterpreterFactory
     private lateinit var cameraManager: CameraManager
     private lateinit var faceDetector: FaceDetector
     private lateinit var faceNet: MobileFaceNet
@@ -102,12 +106,13 @@ class MainActivity : FlutterActivity() {
      * ========================================================= */
 
     /**
-     * Executor مخصص لكل ما هو ثقيل:
-     * - Face detection
+     * Executor لكل العمليات الثقيلة:
+     * - Face Detection
+     * - FAS
      * - Liveness
      * - Embedding
      *
-     * ❗ لا ML على thread الكاميرا
+     * ❗ ممنوع تنفيذ أي ML على Thread الكاميرا
      */
     private val inferenceExecutor =
         Executors.newSingleThreadExecutor()
@@ -115,14 +120,12 @@ class MainActivity : FlutterActivity() {
     /* =========================================================
      * Liveness
      * ========================================================= */
-
     private lateinit var livenessOrchestrator: LivenessOrchestrator
     private val facialMetricsEngine = FacialMetricsEngine()
 
     /* =========================================================
      * Constants
      * ========================================================= */
-
     companion object {
         private const val CAMERA_PERMISSION_REQUEST = 101
         private const val ATTENDANCE_CHANNEL = "attendance_channel"
@@ -131,42 +134,37 @@ class MainActivity : FlutterActivity() {
     /* =========================================================
      * Flutter Engine Setup
      * ========================================================= */
-
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        /**
-         * ✅ 1) تجهيز SystemStatusReporter
-         *
-         * هذا الكلاس:
-         * - ينقل أي حالة من Native → Flutter
-         * - Flutter يبني UX بناءً عليه
+        /* ---------------------------------------------------------
+         * 1) System Status Reporter
+         * ---------------------------------------------------------
+         * ينقل أي حالة من Native → Flutter
+         * Flutter هو من يقرر كيف يعرضها للمستخدم
          */
         statusReporter = SystemStatusReporter { status ->
             Log.d("SystemStatus", status.name)
         }
 
-        /**
-         * ✅ 2) حقن كل Native Core هنا
-         *
+        /* ---------------------------------------------------------
+         * 2) إنشاء AttendanceUseCase
+         * ---------------------------------------------------------
          * هذه هي نقطة الإغلاق المعماري:
-         * بعد هذا السطر لا يوجد TODO
+         * كل ما يحتاجه النظام يُنشأ هنا
          */
         val attendanceUseCase = provideAttendanceUseCase()
 
-        val gpuPolicy = GpuPolicy.USER_CHOICE
-        val userPrefersGpu = true
-
-        /**
-         * ✅ 3) إنشاء MethodChannel
-         *
-         * Flutter هو من:
+        /* ---------------------------------------------------------
+         * 3) MethodChannel
+         * ---------------------------------------------------------
+         * Flutter:
          * - يستدعي startAttendance
-         * - يمرر employeeId
+         * - يمرر employeeId والسياسات
          *
          * Native:
-         * - ينفّذ
-         * - ويُعيد AttendanceDecision
+         * - ينفذ
+         * - يعيد AttendanceDecision
          */
         val channel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -179,30 +177,15 @@ class MainActivity : FlutterActivity() {
     }
 
     /* =========================================================
-     * Dependency Providers (Manual DI)
+     * Dependency Providers (Manual Dependency Injection)
      * ========================================================= */
-
-    /**
-     * MatchingPolicy
-     *
-     * سياسة افتراضية على مستوى Native
-     * سيتم override لاحقًا من Flutter
-     */
-    private fun provideMatchingPolicy(): MatchingPolicy {
-        return MatchingPolicy(
-            defaultThreshold = 1.2,
-            referenceValidationPolicy =
-                ReferenceValidationPolicy.VALIDATE_ONCE_AT_ENROLLMENT
-        )
-    }
 
     /**
      * FaceMatchingUseCase
      *
-     * هنا يتم حقن:
-     * - Repository مشفّر
-     * - Policy
-     * - Access strategy (LOCAL / REMOTE / HYBRID)
+     * - Repository مشفر
+     * - Matching policy
+     * - Access strategy
      */
     private fun provideFaceMatchingUseCase(): FaceMatchingUseCase {
 
@@ -210,7 +193,11 @@ class MainActivity : FlutterActivity() {
             LocalEncryptedEmployeeReferenceRepository(this)
 
         return FaceMatchingUseCase(
-            policy = provideMatchingPolicy(),
+            policy = MatchingPolicy(
+                defaultThreshold = 1.2,
+                referenceValidationPolicy =
+                    ReferenceValidationPolicy.VALIDATE_ONCE_AT_ENROLLMENT
+            ),
             referenceAccessPolicy = ReferenceAccessPolicy.HYBRID,
             repository = repository,
             groupThreshold = null
@@ -218,30 +205,40 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * AttendanceUseCase
+     * FAS Orchestrator
      *
-     * ✅ هذا هو القرار النهائي للحضور داخل Native
+     * هنا نربط كل نماذج FAS المتاحة
+     * بدون أي منطق قرار
      */
-    private fun provideAttendanceUseCase(): AttendanceUseCase {
-        return AttendanceUseCase(
-            faceMatchingUseCase = provideFaceMatchingUseCase()
+    private fun provideFASOrchestrator(): FASOrchestrator {
+
+        val fasModels = mapOf(
+
+            "minifasnet_v2_80x80_default" to MiniFASNetV2Model(applicationContext),
+            "minifasnet_v1se_80x80_light" to MiniFASNetV1SEModel(applicationContext),
+            "fastfasnet_v3_128x128_highsec" to FastFASNetV3Model(applicationContext)
+
         )
+
+        return FASOrchestrator(fasModels)
     }
 
     /**
-     * Audit Logger (Encrypted)
+     * AttendanceUseCase
      *
-     * Native يسجل فقط
-     * Flutter سيقرر متى يزامن
+     * ✅ هذا هو Gate القرار النهائي للحضور
+     * ✅ كل الانتهاكات الأمنية تُفلتر هنا
      */
-    private fun provideAuditLogger(): LocalEncryptedAttendanceAuditLogger {
-        return LocalEncryptedAttendanceAuditLogger(this)
+    private fun provideAttendanceUseCase(): AttendanceUseCase {
+        return AttendanceUseCase(
+            faceMatchingUseCase = provideFaceMatchingUseCase(),
+            fasOrchestrator = provideFASOrchestrator()
+        )
     }
 
     /* =========================================================
      * Activity Lifecycle
      * ========================================================= */
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -256,7 +253,6 @@ class MainActivity : FlutterActivity() {
     /* =========================================================
      * Camera Pipeline
      * ========================================================= */
-
     private fun startCameraPipeline() {
 
         val previewView =
@@ -278,23 +274,29 @@ class MainActivity : FlutterActivity() {
 
             inferenceExecutor.execute {
                 try {
+
+                    /* 1) Quality Check */
                     if (
                         ImageQualityChecker.checkFrame(bitmap)
                         != SystemStatus.OK
-                    ) {
-                        return@execute
-                    }
+                    ) return@execute
 
+
+
+                    /* 2) Face Detection */
                     val detection =
                         faceDetector.detectBestFace(bitmap)
                             ?: return@execute
 
+                    /* 3) Crop Face */
                     val faceBitmap =
                         FaceCropper.cropFace(
                             bitmap,
                             detection.box
                         ) ?: return@execute
-
+// ✅ تخزين آخر وجه صالح للجلسة الحالية
+                    AttendanceSession.updateFace(faceBitmap)
+                    /* 4) Active Liveness */
                     val metrics =
                         facialMetricsEngine
                             .computeFrameFromBitmap(faceBitmap)
@@ -311,11 +313,13 @@ class MainActivity : FlutterActivity() {
                         return@execute
                     }
 
+                    /* 5) Embedding Extraction */
                     val embedding =
                         faceNet.getEmbedding(faceBitmap)
 
-                    // ✅ embedding جاهز
-                    // ✅ القرار سيأتي لاحقًا من Flutter
+                    // ✅ الوجه جاهز
+                    // ✅ FAS + Matching سيتمان عبر AttendanceUseCase
+                    // ✅ القرار النهائي يأتي من Flutter
 
                 } catch (e: Exception) {
                     statusReporter.report(
@@ -336,7 +340,6 @@ class MainActivity : FlutterActivity() {
     /* =========================================================
      * Permissions
      * ========================================================= */
-
     private fun hasCameraPermission(): Boolean =
         ContextCompat.checkSelfPermission(
             this,
@@ -354,7 +357,6 @@ class MainActivity : FlutterActivity() {
     /* =========================================================
      * Cleanup
      * ========================================================= */
-
     override fun onDestroy() {
         super.onDestroy()
         inferenceExecutor.shutdown()
