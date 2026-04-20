@@ -54,7 +54,7 @@ class FastFASNetV3Model(
 
         val resized = resizeBitmap(faceBitmap, inputSize)
         val inputBuffer = createInputBuffer(inputSize)
-
+        val startInference = System.nanoTime()
         /**
          * PyTorch ImageNet normalization
          */
@@ -91,6 +91,17 @@ class FastFASNetV3Model(
                 reason = "FastFASNet inference failed: ${e.message}"
             )
         }
+
+        val inferenceMs =
+            (System.nanoTime() - startInference) / 1_000_000
+
+        com.mahmoud.attendify.metrics.FasRuntimeMetrics.log(
+            modelId = id,
+            useGpu = supportsGpu,
+            stage = "inference",
+            durationMs = inferenceMs
+        )
+
 
         val spoofLogit = output[0][0]
         val realLogit  = output[0][1]

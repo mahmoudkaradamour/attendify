@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import com.mahmoud.attendify.fas.core.FASModel
 import com.mahmoud.attendify.fas.core.FASResult
+import com.mahmoud.attendify.metrics.FasRuntimeMetrics
 import kotlin.math.exp
 
 /**
@@ -86,15 +87,28 @@ class MiniFASNetV1SEModel(
         }
 
         val output = Array(1) { FloatArray(2) }
-
+        val startInferenceNs = System.nanoTime()
         try {
             interpreter.run(inputBuffer, output)
         } catch (e: Exception) {
             return FASResult.Inconclusive(
                 reason = "MiniFASNetV1SE inference failed: ${e.message}"
             )
-        }
 
+
+
+
+        }
+        val inferenceMs =
+            (System.nanoTime() - startInferenceNs) / 1_000_000
+
+        // ✅ تسجيل زمن inference
+        FasRuntimeMetrics.log(
+            modelId = id,
+            useGpu = false,
+            stage = "inference",
+            durationMs = inferenceMs
+        )
         val spoofLogit = output[0][0]
         val realLogit  = output[0][1]
 
