@@ -74,11 +74,14 @@ abstract class BaseFASModel(
      */
     override fun prepare(useGpu: Boolean) {
 
-        val policy =
-            if (useGpu && supportsGpu)
-                GpuPolicy.FORCED_ON
-            else
-                GpuPolicy.FORCED_OFF
+//        val policy =
+//            if (useGpu && supportsGpu)
+//                GpuPolicy.FORCED_ON
+//            else
+//                GpuPolicy.FORCED_OFF
+
+// 🔧 اختبار فقط: تعطيل كل الـ delegates
+        val policy = GpuPolicy.FORCED_OFF
 
         val startNs = System.nanoTime()
 
