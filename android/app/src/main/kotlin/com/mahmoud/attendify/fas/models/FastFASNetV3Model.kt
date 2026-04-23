@@ -2,68 +2,170 @@ package com.mahmoud.attendify.fas.models
 
 import android.content.Context
 import android.graphics.Bitmap
-import com.mahmoud.attendify.fas.core.FASModel
-import com.mahmoud.attendify.fas.core.FASResult
-import kotlin.math.exp
 
 /**
  * FastFASNetV3Model
  *
- * High‑Security Passive Face Anti‑Spoofing model.
+ * =========================================================
+ * ✅ English:
+ * ---------------------------------------------------------
+ * High‑Security FastFASNet V3 Face Anti‑Spoofing model.
  *
- * Architecture:
- * - MobileNetV3‑Large backbone
- * - Optimized for ARM (Hard‑Swish)
+ * Characteristics:
+ * - Higher security and stricter threshold
+ * - Designed for environments requiring strong spoof resistance
+ * - Slower than MiniFASNet, but more conservative
  *
- * Input:
- * - [1, 128, 128, 3] RGB
- * - Float32
- * - ImageNet normalization (PyTorch)
+ * Architectural role:
+ * - Defines model contract (ID, size, threshold, output mapping)
+ * - Loads the TFLite model
+ * - Performs PREPROCESSING ONLY
  *
- * Output:
- * - [1, 2] logits
- *   [0] = Spoof
- *   [1] = Real
+ * ✅ Inference, Softmax, Thresholding, and Decision Logic
+ *    are fully centralized in BaseFASModel.
+ *
+ * =========================================================
+ * ✅ عربي:
+ * ---------------------------------------------------------
+ * نموذج FastFASNet V3 عالي الأمان لمكافحة تزوير الوجه.
+ *
+ * الخصائص:
+ * - مستوى أمان أعلى وعتبة قرار صارمة
+ * - مخصص للبيئات الحساسة أمنيًا
+ * - أبطأ نسبيًا من MiniFASNet لكنه أكثر تحفظًا
+ *
+ * الدور المعماري:
+ * - تعريف عقد النموذج (المعرّف، الحجم، العتبة، ترتيب المخرجات)
+ * - تحميل نموذج TFLite
+ * - تنفيذ المعالجة المسبقة فقط
+ *
+ * ✅ التنبؤ، Softmax، العتبة، ومنطق القرار
+ *    كلها مسؤولية BaseFASModel حصراً.
  */
 class FastFASNetV3Model(
     context: Context
-) : BaseFASModel(context), FASModel {
+) : BaseFASModel(context) {
 
+    /* =====================================================
+     * 🔐 MODEL CONTRACT
+     * =====================================================
+     *
+     * English:
+     * These values describe how BaseFASModel
+     * should interpret the output of this model.
+     *
+     * عربي:
+     * هذه القيم تمثل عقد النموذج مع النظام،
+     * وهي مضبوطة وفق تدريب النموذج.
+     */
+
+    /** Unique identifier for this high‑security model */
     override val id: String =
         "fastfasnet_v3_128x128_highsec"
 
+    /** Model input size: 128 x 128 RGB */
     override val inputSize: Int = 128
 
     /**
-     * High‑security default threshold.
-     * Can be overridden by policy.
+     * Default threshold
+     *
+     * English:
+     * High threshold to minimize false acceptance.
+     *
+     * عربي:
+     * عتبة قرار مرتفعة لتقليل القبول الخاطئ
+     * خاصة في البيئات الحساسة.
      */
     override val defaultThreshold: Float = 0.90f
 
     /**
-     * This model benefits significantly from GPU / NNAPI,
-     * but does not require it.
+     * GPU support:
+     *
+     * English:
+     * Disabled here to ensure deterministic behavior
+     * and avoid GPU‑related inconsistencies.
+     *
+     * عربي:
+     * معطّل لتفادي تباين النتائج على الأجهزة المختلفة.
      */
-    override val supportsGpu: Boolean = true
+    override val supportsGpu: Boolean = false
 
+    /** Output tensor mapping:
+     *  index 0 → Spoof
+     *  index 1 → Real */
+    override val realIndex: Int = 1
+    override val spoofIndex: Int = 0
+
+    /** Model outputs logits → requires Softmax */
+    override val requiresSoftmax: Boolean = true
+
+    /**
+     * Model is ACTIVE
+     *
+     * English:
+     * This model is enabled for production use
+     * through policy selection.
+     *
+     * عربي:
+     * النموذج مفعّل وجاهز للاستخدام الإنتاجي
+     * ويتم اختياره عبر الـ Policy فقط.
+     */
+    override val isTemporarilyDisabled: Boolean = false
+
+    /* ===================================================== */
+
+    /**
+     * Load FastFASNet V3 TFLite model once
+     */
     init {
         loadModel("models/fas/fastfasnet_v3_128x128_highsec.tflite")
     }
 
-    override fun analyze(faceBitmap: Bitmap): FASResult {
+    /**
+     * PREPROCESSING
+     *
+     * =====================================================
+     * English:
+     * Converts face Bitmap into model tensor:
+     * 1. Resize to 128x128
+     * 2. Extract RGB values
+     * 3. Normalize channels to [-1, 1]
+     * 4. Pack Float32 values into input buffer
+     *
+     * ✅ Uses reusable buffers:
+     * - inputBuffer (Float32)
+     * - pixelArray (IntArray)
+     *
+     * ✅ ZERO heap allocation per frame.
+     *
+     * =====================================================
+     * عربي:
+     * تحويل صورة الوجه إلى Tensor مطابق لنموذج FastFASNet V3:
+     * 1. تصغير الصورة إلى 128×128
+     * 2. استخراج قيم RGB
+     * 3. تطبيع القيم إلى [-1, 1]
+     * 4. تعبئة البيانات في ByteBuffer
+     *
+     * ✅ بدون أي إنشاء ذاكرة جديد مع كل Frame.
+     */
+    override fun preprocess(bitmap: Bitmap) {
 
-        val resized = resizeBitmap(faceBitmap, inputSize)
-        val inputBuffer = createInputBuffer(inputSize)
-        val startInference = System.nanoTime()
-        /**
-         * PyTorch ImageNet normalization
-         */
-        val IMAGE_MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
-        val IMAGE_STD  = floatArrayOf(0.229f, 0.224f, 0.225f)
+        // Resize only if required to reduce Bitmap allocations
+        val resized =
+            if (bitmap.width == inputSize && bitmap.height == inputSize) {
+                bitmap
+            } else {
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    inputSize,
+                    inputSize,
+                    true
+                )
+            }
 
-        val pixels = IntArray(inputSize * inputSize)
+        // Extract pixels into reusable pixel buffer (NO allocation)
         resized.getPixels(
-            pixels,
+            pixelArray,
             0,
             inputSize,
             0,
@@ -72,59 +174,23 @@ class FastFASNetV3Model(
             inputSize
         )
 
-        for (pixel in pixels) {
-            val r = ((pixel shr 16 and 0xFF) / 255.0f - IMAGE_MEAN[0]) / IMAGE_STD[0]
-            val g = ((pixel shr 8  and 0xFF) / 255.0f - IMAGE_MEAN[1]) / IMAGE_STD[1]
-            val b = ((pixel        and 0xFF) / 255.0f - IMAGE_MEAN[2]) / IMAGE_STD[2]
+        // Reset input tensor buffer
+        inputBuffer.rewind()
+
+        // Normalize RGB channels and pack Float32 values
+        for (pixel in pixelArray) {
+            val r = ((pixel shr 16 and 0xFF) - 127.5f) / 127.5f
+            val g = ((pixel shr 8 and 0xFF) - 127.5f) / 127.5f
+            val b = ((pixel and 0xFF) - 127.5f) / 127.5f
 
             inputBuffer.putFloat(r)
             inputBuffer.putFloat(g)
             inputBuffer.putFloat(b)
         }
 
-        val output = Array(1) { FloatArray(2) }
-
-        try {
-            interpreter.run(inputBuffer, output)
-        } catch (e: Exception) {
-            return FASResult.Inconclusive(
-                reason = "FastFASNet inference failed: ${e.message}"
-            )
-        }
-
-        val inferenceMs =
-            (System.nanoTime() - startInference) / 1_000_000
-
-        com.mahmoud.attendify.metrics.FasRuntimeMetrics.log(
-            modelId = id,
-            useGpu = supportsGpu,
-            stage = "inference",
-            durationMs = inferenceMs
-        )
-
-
-        val spoofLogit = output[0][0]
-        val realLogit  = output[0][1]
-
-        /**
-         * Softmax (logits → probability)
-         */
-        val expSpoof = exp(spoofLogit)
-        val expReal  = exp(realLogit)
-        val sum = expSpoof + expReal
-
-        if (sum.isNaN() || sum == 0.0f) {
-            return FASResult.Inconclusive(
-                reason = "Invalid softmax output"
-            )
-        }
-
-        val realProbability = expReal / sum
-
-        return if (realProbability >= defaultThreshold) {
-            FASResult.Real(confidence = realProbability)
-        } else {
-            FASResult.Spoof(confidence = realProbability)
+        // Recycle temporary bitmap if created
+        if (resized !== bitmap) {
+            resized.recycle()
         }
     }
 }

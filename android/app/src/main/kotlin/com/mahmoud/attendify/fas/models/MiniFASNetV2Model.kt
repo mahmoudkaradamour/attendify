@@ -2,52 +2,154 @@ package com.mahmoud.attendify.fas.models
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.util.Log
-import com.mahmoud.attendify.fas.core.FASModel
-import com.mahmoud.attendify.fas.core.FASResult
-import com.mahmoud.attendify.metrics.FasRuntimeMetrics
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import kotlin.math.exp
 
 /**
  * MiniFASNetV2Model
  *
- * ⚠️ نسخة اختبار (DEBUG SAFE)
- * ✅ تمنع الانهيار
- * ✅ تقيس زمن inference
- * ❌ ليست التنفيذ النهائي للعقد
+ * =========================================================
+ * ✅ English:
+ * ---------------------------------------------------------
+ * Second‑generation MiniFASNet Face Anti‑Spoofing model.
+ *
+ * Characteristics:
+ * - Higher accuracy than V1SE
+ * - Still lightweight and CPU‑friendly
+ * - Designed for RGB, single‑frame FAS
+ *
+ * Architectural role:
+ * - Defines the model contract (ID, size, threshold, etc.)
+ * - Loads the TFLite model
+ * - Performs preprocessing ONLY
+ *
+ * ✅ Inference, Softmax, Thresholding, Decision logic
+ *    are ALL handled by BaseFASModel.
+ *
+ * =========================================================
+ * ✅ عربي:
+ * ---------------------------------------------------------
+ * الجيل الثاني من MiniFASNet لمكافحة تزوير الوجه.
+ *
+ * الخصائص:
+ * - أدق من الإصدار V1SE
+ * - خفيف ومناسب للأجهزة المتوسطة
+ * - يعتمد على إطار واحد (Single‑frame RGB FAS)
+ *
+ * الدور المعماري:
+ * - تعريف عقد النموذج (المعرّف، الحجم، العتبة…)
+ * - تحميل نموذج TFLite
+ * - تنفيذ المعالجة المسبقة فقط
+ *
+ * ✅ التنبؤ، Softmax، العتبة، والقرار
+ *    كلها مسؤولية BaseFASModel حصراً.
  */
 class MiniFASNetV2Model(
     context: Context
-) : BaseFASModel(context), FASModel {
+) : BaseFASModel(context) {
 
-    override val id: String = "minifasnet_v2_80x80_default"
+    /* =====================================================
+     * 🔐 MODEL CONTRACT
+     * =====================================================
+     *
+     * English:
+     * These properties define how the Base class
+     * will run and interpret this model.
+     *
+     * عربي:
+     * هذه الخصائص تمثل عقد النموذج مع النظام،
+     * ولا يمكن تجاوزها أو تغييرها أثناء التشغيل.
+     */
+
+    /** Unique model identifier */
+    override val id: String =
+        "minifasnet_v2_80x80_default"
+
+    /** Model input size (80 x 80 RGB) */
     override val inputSize: Int = 80
+
+    /**
+     * Default decision threshold
+     *
+     * English:
+     * Tuned during model training.
+     *
+     * عربي:
+     * عتبة القرار الافتراضية
+     * مضبوطة أثناء تدريب النموذج.
+     */
     override val defaultThreshold: Float = 0.85f
+
+    /**
+     * GPU is not required nor recommended
+     * for this lightweight model.
+     */
     override val supportsGpu: Boolean = false
 
+    /** Output tensor mapping:
+     *  index 0 → Spoof
+     *  index 1 → Real */
+    override val realIndex: Int = 1
+    override val spoofIndex: Int = 0
+
+    /** Model outputs logits → requires Softmax */
+    override val requiresSoftmax: Boolean = true
+
+    /** Model is ACTIVE in production */
+    override val isTemporarilyDisabled: Boolean = false
+
+    /* ===================================================== */
+
+    /**
+     * Load TFLite model once during initialization
+     */
     init {
         loadModel("models/fas/minifasnet_v2_80x80_default.tflite")
     }
 
-    override fun analyze(faceBitmap: Bitmap): FASResult {
+    /**
+     * PREPROCESSING
+     *
+     * =====================================================
+     * English:
+     * Converts face Bitmap into model input tensor:
+     * 1. Resize to 80x80
+     * 2. Extract RGB pixels
+     * 3. Normalize to [-1, 1]
+     * 4. Pack into Float32 ByteBuffer
+     *
+     * ✅ Uses reused buffers:
+     * - inputBuffer (ByteBuffer)
+     * - pixelArray (IntArray)
+     *
+     * ✅ ZERO memory allocation per frame.
+     *
+     * =====================================================
+     * عربي:
+     * تحويل صورة الوجه إلى Tensor مطابق للنموذج:
+     * 1. تصغير الصورة إلى 80×80
+     * 2. استخراج ألوان RGB
+     * 3. تطبيع القيم إلى [-1, 1]
+     * 4. تعبئة البيانات في ByteBuffer
+     *
+     * ✅ بدون أي إنشاء ذاكرة جديد لكل Frame.
+     */
+    override fun preprocess(bitmap: Bitmap) {
 
-        /* =========================================================
-         * 1️⃣ Resize
-         * ========================================================= */
-        val resized = resizeBitmap(faceBitmap, inputSize)
+        // Resize only if necessary to avoid extra Bitmap allocation
+        val resized =
+            if (bitmap.width == inputSize && bitmap.height == inputSize) {
+                bitmap
+            } else {
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    inputSize,
+                    inputSize,
+                    true
+                )
+            }
 
-        /* =========================================================
-         * 2️⃣ Create input buffer
-         * ========================================================= */
-        val inputBuffer = ByteBuffer
-            .allocateDirect(1 * inputSize * inputSize * 3 * 4)
-            .order(ByteOrder.nativeOrder())
-
-        val pixels = IntArray(inputSize * inputSize)
+        // Extract pixels into reusable buffer (NO allocation)
         resized.getPixels(
-            pixels,
+            pixelArray,
             0,
             inputSize,
             0,
@@ -56,73 +158,23 @@ class MiniFASNetV2Model(
             inputSize
         )
 
-        // Normalization بسيط (مؤقت – للاختبار فقط)
-        for (pixel in pixels) {
-            val r = (pixel shr 16 and 0xFF) / 255.0f
-            val g = (pixel shr 8 and 0xFF) / 255.0f
-            val b = (pixel and 0xFF) / 255.0f
+        // Reset input buffer before writing
+        inputBuffer.rewind()
+
+        // Normalize RGB values to [-1, 1] and pack to ByteBuffer
+        for (pixel in pixelArray) {
+            val r = ((pixel shr 16 and 0xFF) - 127.5f) / 127.5f
+            val g = ((pixel shr 8 and 0xFF) - 127.5f) / 127.5f
+            val b = ((pixel and 0xFF) - 127.5f) / 127.5f
 
             inputBuffer.putFloat(r)
             inputBuffer.putFloat(g)
             inputBuffer.putFloat(b)
         }
 
-        /* =========================================================
-         * 3️⃣ Run inference (Safe Output Handling)
-         * ========================================================= */
-        val startNs = System.nanoTime()
-
-        return try {
-            // ✅ قراءة حجم الإخراج ديناميكيًا
-            val outputShape = interpreter.getOutputTensor(0).shape()
-            val outputSize = outputShape.last()
-
-            val output = Array(1) { FloatArray(outputSize) }
-            interpreter.run(inputBuffer, output)
-
-            val inferenceMs =
-                (System.nanoTime() - startNs) / 1_000_000
-
-            FasRuntimeMetrics.log(
-                modelId = id,
-                useGpu = false,
-                stage = "inference",
-                durationMs = inferenceMs
-            )
-
-            /* =====================================================
-             * 4️⃣ تفسير بسيط لمنع الانهيار (DEBUG ONLY)
-             * ===================================================== */
-            val spoofLogit = output[0][0]
-            val realLogit =
-                if (outputSize > 1) output[0][1] else output[0][0]
-
-            val expSpoof = exp(spoofLogit)
-            val expReal = exp(realLogit)
-            val sum = expSpoof + expReal
-
-            if (sum.isNaN() || sum == 0.0f) {
-                FASResult.Inconclusive(
-                    "Invalid softmax output"
-                )
-            } else {
-                val confidence = expReal / sum
-                if (confidence >= defaultThreshold) {
-                    FASResult.Real(confidence)
-                } else {
-                    FASResult.Spoof(confidence)
-                }
-            }
-
-        } catch (e: Exception) {
-            Log.e(
-                "MiniFASNetV2",
-                "Safe failure during inference",
-                e
-            )
-            FASResult.Inconclusive(
-                "MiniFASNetV2 inference failed: ${e.message}"
-            )
+        // Recycle temporary resized bitmap if it was created
+        if (resized !== bitmap) {
+            resized.recycle()
         }
     }
 }

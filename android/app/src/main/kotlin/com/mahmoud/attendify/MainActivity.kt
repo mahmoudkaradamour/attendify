@@ -1,5 +1,5 @@
 package com.mahmoud.attendify
-//55
+
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -26,6 +26,10 @@ import com.mahmoud.attendify.face.FaceCropper
 import com.mahmoud.attendify.face.FaceDetector
 import com.mahmoud.attendify.face.MobileFaceNet
 
+/* ================= Static Debug Tests ================= */
+import com.mahmoud.attendify.fas.debug.FASStaticImageTester
+import com.mahmoud.attendify.face.debug.MobileFaceNetStaticTester
+
 /* ================= Liveness ================= */
 import com.mahmoud.attendify.liveness.LivenessOrchestrator
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
@@ -34,7 +38,6 @@ import com.mahmoud.attendify.liveness.result.LivenessResult
 /* ================= Attendance ================= */
 import com.mahmoud.attendify.attendance.AttendanceUseCase
 import com.mahmoud.attendify.attendance.AttendanceSession
-import com.mahmoud.attendify.fas.debug.FASStaticImageTester
 
 /* ================= Matching ================= */
 import com.mahmoud.attendify.matching.FaceMatchingUseCase
@@ -52,10 +55,15 @@ import com.mahmoud.attendify.fas.models.MiniFASNetV1SEModel
 /**
  * MainActivity
  *
- * ✅ نسخة Debug للاختبار والقياس فقط
- * ✅ حل Timeout: Cannot complete surfaceList within 5000
- * ✅ منع ضغط الـ Main Thread (تشغيل FAS static test خارج الـ UI thread)
- * ✅ بدء الكاميرا فقط عند جاهزية الـ Window + وجود الصلاحية
+ * Arabic:
+ * ✅ نسخة Debug منظمة للاختبار المرحلي
+ * ✅ لا تغيّر أي منطق إنتاجي
+ * ✅ كل الاختبارات الثقيلة خارج Main Thread
+ *
+ * English:
+ * ✅ Safe debug-oriented activity for incremental testing
+ * ✅ No production logic changes
+ * ✅ All heavy inference runs off the UI thread
  */
 class MainActivity : FlutterActivity() {
 
@@ -66,24 +74,36 @@ class MainActivity : FlutterActivity() {
     private lateinit var statusReporter: SystemStatusReporter
 
     /**
-     * ⚠️ ملاحظة مهمة:
-     * في كودك السابق كان livenessOrchestrator lateinit ولم يتم تهيئته داخل الملف الذي أرسلته،
-     * وهذا قد يسبب Crash لاحقًا عند بدء الـ analyzer.
+     * ⚠️ LivenessOrchestrator is optional in debug
      *
-     * لذلك جعلناه nullable + تشغيله اختياري (Fail-safe) لحين تهيئته بالطريقة الصحيحة من مشروعك.
-     * عندما تكون جاهزًا، ضع تهيئته في provideLivenessOrchestrator() أو initLivenessOrchestrator().
+     * Arabic:
+     * نجعلها nullable لتجنب أي Crash
+     * إلى أن يتم ربط سياسة Liveness النهائية.
+     *
+     * English:
+     * Nullable for fail-safe debug operation
+     * until final policy wiring is complete.
      */
     private var livenessOrchestrator: LivenessOrchestrator? = null
     private val facialMetricsEngine = FacialMetricsEngine()
 
+    /**
+     * ✅ Executor موحد لكل اختبارات ML
+     *
+     * Arabic:
+     * يمنع الضغط على UI ويضمن تسلسل التنفيذ.
+     *
+     * English:
+     * Single-thread executor for deterministic ML execution.
+     */
     private val inferenceExecutor = Executors.newSingleThreadExecutor()
 
-    // PreviewView Overlay فوق Flutter حتى لا نعتمد على FlutterSurfaceView أثناء الإقلاع (حيث يكون 0x0)
+    // PreviewView Overlay فوق Flutter لضمان Surface حقيقي فورًا
     private var previewView: PreviewView? = null
 
-    // Flags لضمان عدم تشغيل الكاميرا أكثر من مرة
-    private var hasWindowFocusNow: Boolean = false
-    private var cameraStarted: Boolean = false
+    // Flags لمنع تشغيل الكاميرا أكثر من مرة
+    private var hasWindowFocusNow = false
+    private var cameraStarted = false
 
     companion object {
         private const val CAMERA_PERMISSION_REQUEST = 101
@@ -100,12 +120,16 @@ class MainActivity : FlutterActivity() {
 
         attendanceUseCase = provideAttendanceUseCase()
 
-        // MethodChannel موجود ولكن غير مستخدم الآن (Debug)
+        // ✅ MethodChannel موجود فقط كجسر (غير مستخدم الآن)
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             ATTENDANCE_CHANNEL
         )
     }
+
+    /* =========================================================
+     * Dependency Providers
+     * ========================================================= */
 
     private fun provideFaceMatchingUseCase(): FaceMatchingUseCase {
         val repository = LocalEncryptedEmployeeReferenceRepository(this)
@@ -113,7 +137,8 @@ class MainActivity : FlutterActivity() {
         return FaceMatchingUseCase(
             policy = MatchingPolicy(
                 defaultThreshold = 1.2,
-                referenceValidationPolicy = ReferenceValidationPolicy.VALIDATE_ONCE_AT_ENROLLMENT
+                referenceValidationPolicy =
+                    ReferenceValidationPolicy.VALIDATE_ONCE_AT_ENROLLMENT
             ),
             referenceAccessPolicy = ReferenceAccessPolicy.HYBRID,
             repository = repository,
@@ -126,7 +151,6 @@ class MainActivity : FlutterActivity() {
             mapOf(
                 "minifasnet_v2_80x80_default" to MiniFASNetV2Model(this),
                 "minifasnet_v1se_80x80_light" to MiniFASNetV1SEModel(this)
-                // ❌ FastFASNet مستبعد مؤقتًا
             )
         )
     }
@@ -141,15 +165,13 @@ class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ✅ لا نبدأ الكاميرا هنا مباشرة لتجنب surfaceList timeout أثناء startup
-        // سنبدأها فقط عندما:
-        // 1) Window أخذ focus
-        // 2) Permission موجودة
+        /* =====================================================
+         * ✅ Gate الكاميرا (لا تشغيل مبكر)
+         * ===================================================== */
         tryStartCameraWhenReady()
 
         /* =====================================================
-         * ✅ DEBUG ONLY: Static FAS benchmark (SAFE)
-         * تشغيله على inferenceExecutor لتخفيف الضغط عن Main Thread
+         * ✅ Static FAS test (مرحلة 1)
          * ===================================================== */
         inferenceExecutor.execute {
             try {
@@ -164,38 +186,40 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // ✅ يمكنك لاحقًا اختبار صور spoof هنا (أيضًا على executor)
-        /*
+        /* =====================================================
+         * ✅ Static MobileFaceNet test (مرحلة 2)
+         *
+         * Arabic:
+         * نفس منهج FAS:
+         * صور ثابتة → كشف وجه → Embedding → قياس المسافات
+         *
+         * English:
+         * Static embedding contract test using 3 known images.
+         * ===================================================== */
         inferenceExecutor.execute {
-            FASStaticImageTester.runTest(
-                context = this,
-                model = MiniFASNetV2Model(this),
-                assetImagePath = "test_faces/printed_photo.jpg",
-                useGpu = false
-            )
-            FASStaticImageTester.runTest(
-                context = this,
-                model = MiniFASNetV2Model(this),
-                assetImagePath = "test_faces/screen_attack.jpg",
-                useGpu = false
-            )
+            try {
+                MobileFaceNetStaticTester.run3ImageSuite(
+                    context = this,
+                    imageReal = "test_faces/real_face.jpg",
+                    imagePrinted = "test_faces/printed_photo.jpg",
+                    imageScreen = "test_faces/screen_attack.jpg"
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "MobileFaceNet static suite failed", e)
+            }
         }
-        */
     }
 
-    /**
-     * ✅ أفضل مكان لالتقاط أن الواجهة أصبحت جاهزة
-     * لأن FlutterSurfaceView يكون أحيانًا 0x0 في البداية.
-     */
+    /* =========================================================
+     * Camera lifecycle control
+     * ========================================================= */
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         hasWindowFocusNow = hasFocus
         tryStartCameraWhenReady()
     }
 
-    /**
-     * ✅ عند منح صلاحية الكاميرا نبدأ مباشرة بدون إعادة تشغيل التطبيق
-     */
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -204,33 +228,32 @@ class MainActivity : FlutterActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
 
         if (requestCode == CAMERA_PERMISSION_REQUEST) {
-            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val granted =
+                grantResults.isNotEmpty() &&
+                        grantResults[0] == PackageManager.PERMISSION_GRANTED
             Log.d(TAG, "Camera permission result: granted=$granted")
             tryStartCameraWhenReady()
         }
     }
 
     /**
-     * ✅ Gate موحد: لا يبدأ الكاميرا إلا إذا:
-     * - Window جاهز (hasWindowFocusNow)
-     * - Permission موجودة
-     * - ولم نبدأ الكاميرا سابقًا
+     * Arabic:
+     * Gate موحد يمنع تشغيل الكاميرا قبل:
+     * - جاهزية Window
+     * - وجود Permission
+     *
+     * English:
+     * Unified gate to safely start CameraX.
      */
     private fun tryStartCameraWhenReady() {
         if (cameraStarted) return
-
-        if (!hasWindowFocusNow) {
-            Log.d(TAG, "Camera not started: window has no focus yet.")
-            return
-        }
+        if (!hasWindowFocusNow) return
 
         if (!hasCameraPermission()) {
-            Log.d(TAG, "Camera not started: permission missing → requesting.")
             requestCameraPermission()
             return
         }
 
-        // الآن الشروط مكتملة
         startCameraPipeline()
     }
 
@@ -238,15 +261,11 @@ class MainActivity : FlutterActivity() {
         if (cameraStarted) return
         cameraStarted = true
 
-        // ✅ PreviewView Overlay فوق Flutter لضمان وجود Surface حقيقي بسرعة
         val pv = PreviewView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
-            // يمكنك لاحقًا ضبط ScaleType أو ImplementationMode لو احتجت
-            // scaleType = PreviewView.ScaleType.FILL_CENTER
-            // implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
         previewView = pv
         addContentView(pv, pv.layoutParams)
@@ -254,17 +273,11 @@ class MainActivity : FlutterActivity() {
         faceDetector = FaceDetector(this)
         faceNet = MobileFaceNet(this)
 
-        // ✅ تهيئة الكاميرا
         cameraManager = CameraManager(
             context = this,
             lifecycleOwner = this,
             statusReporter = statusReporter
         )
-
-        // ✅ (اختياري Fail-safe) تهيئة livenessOrchestrator إن كانت لديك طريقة معروفة
-        // حالياً نتركها null لتجنب Crash إذا كانت تتطلب constructor خاص.
-        // إذا كان لديك constructor افتراضي يمكنك تفعيله:
-        // livenessOrchestrator = LivenessOrchestrator()
 
         val analyzer = FrameAnalyzer { imageProxy ->
             try {
@@ -272,42 +285,41 @@ class MainActivity : FlutterActivity() {
 
                 inferenceExecutor.execute {
                     try {
-                        if (ImageQualityChecker.checkFrame(bitmap) != SystemStatus.OK) {
+                        if (ImageQualityChecker.checkFrame(bitmap) != SystemStatus.OK)
                             return@execute
-                        }
 
-                        val detection = faceDetector.detectBestFace(bitmap) ?: return@execute
+                        val detection =
+                            faceDetector.detectBestFace(bitmap) ?: return@execute
 
-                        val faceBitmap = FaceCropper.cropFace(bitmap, detection.box) ?: return@execute
+                        val faceBitmap =
+                            FaceCropper.cropFace(bitmap, detection.box)
+                                ?: return@execute
 
                         AttendanceSession.updateFace(faceBitmap)
 
-                        // ✅ Liveness (Fail-safe)
-                        val metrics = facialMetricsEngine.computeFrameFromBitmap(faceBitmap)
+                        val metrics =
+                            facialMetricsEngine.computeFrameFromBitmap(faceBitmap)
+
                         val live = livenessOrchestrator
                         if (live != null) {
                             live.onFrame(metrics)
-
                             if (live.evaluate() == LivenessResult.SpoofDetected) {
                                 statusReporter.report(SystemStatus.SPOOF_DETECTED)
                                 return@execute
                             }
-                        } else {
-                            // إذا لم يتم تهيئة liveness بعد، لا نكسر السير
-                            // ويمكنك لاحقًا إرسال Status خاص أو Log فقط
-                            // statusReporter.report(SystemStatus.OK)
                         }
 
                         val embedding = faceNet.getEmbedding(faceBitmap)
 
-                        val decision = attendanceUseCase.attemptAttendance(
-                            faceBitmap = faceBitmap,
-                            liveEmbedding = embedding,
-                            employeeId = "DEBUG_EMPLOYEE",
-                            employeePolicy = null,
-                            groupPolicy = null,
-                            orgPolicy = null
-                        )
+                        val decision =
+                            attendanceUseCase.attemptAttendance(
+                                faceBitmap = faceBitmap,
+                                liveEmbedding = embedding,
+                                employeeId = "DEBUG_EMPLOYEE",
+                                employeePolicy = null,
+                                groupPolicy = null,
+                                orgPolicy = null
+                            )
 
                         Log.d("DEBUG_ATTENDANCE", "Decision=$decision")
 
@@ -319,12 +331,11 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
                 statusReporter.report(SystemStatus.INTERNAL_ERROR)
             } finally {
-                // ✅ مهم جدًا: إغلاق الـ ImageProxy دائمًا لتجنب تسرب الموارد
+                // ✅ ImageProxy يُغلق هنا فقط (منع double-close)
                 imageProxy.close()
             }
         }
 
-        // ✅ نربط الكاميرا بعد أن يصبح الـ PreviewView جاهزًا فعليًا (layout + surface)
         pv.post {
             try {
                 cameraManager.startCamera(
@@ -355,7 +366,6 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-
         inferenceExecutor.shutdown()
 
         if (::cameraManager.isInitialized) {

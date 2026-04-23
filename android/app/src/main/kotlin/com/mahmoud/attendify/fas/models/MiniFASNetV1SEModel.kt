@@ -2,72 +2,154 @@ package com.mahmoud.attendify.fas.models
 
 import android.content.Context
 import android.graphics.Bitmap
-import com.mahmoud.attendify.fas.core.FASModel
-import com.mahmoud.attendify.fas.core.FASResult
-import com.mahmoud.attendify.metrics.FasRuntimeMetrics
-import kotlin.math.exp
 
 /**
  * MiniFASNetV1SEModel
  *
- * Lightweight Passive Face Anti‑Spoofing model.
+ * =========================================================
+ * ✅ English:
+ * ---------------------------------------------------------
+ * First‑generation MiniFASNet with Squeeze‑and‑Excitation (SE).
  *
- * Architecture:
- * - MiniFASNet V1 + Squeeze‑and‑Excitation
+ * Characteristics:
+ * - Lightweight passive Face Anti‑Spoofing model
+ * - Optimized for speed over maximum security
+ * - Suitable for low‑end and mid‑range devices
  *
- * Input:
- * - [1, 80, 80, 3] RGB
- * - Float32
- * - Normalization: [-1, 1]
+ * Architectural role:
+ * - Defines model contract (ID, input size, threshold, etc.)
+ * - Loads the TFLite model
+ * - Performs PREPROCESSING ONLY
  *
- * Output:
- * - [1, 2] logits
- *   [0] = Spoof
- *   [1] = Real
+ * ✅ Inference, Softmax, Thresholding, and Decision Logic
+ *    are fully handled by BaseFASModel.
  *
- * Usage:
- * - Low‑end devices
- * - Factories / high throughput scenarios
+ * =========================================================
+ * ✅ عربي:
+ * ---------------------------------------------------------
+ * الجيل الأول من MiniFASNet مع Squeeze‑and‑Excitation.
+ *
+ * الخصائص:
+ * - نموذج خفيف لمكافحة تزوير الوجه
+ * - مهيأ للسرعة أكثر من أعلى مستوى أمان
+ * - مناسب للأجهزة الضعيفة والمتوسطة
+ *
+ * الدور المعماري:
+ * - تعريف عقد النموذج (المعرّف، الحجم، العتبة…)
+ * - تحميل نموذج TFLite
+ * - تنفيذ المعالجة المسبقة فقط
+ *
+ * ✅ التنبؤ، Softmax، العتبة، والقرار
+ *    كلها مسؤولية BaseFASModel حصراً.
  */
 class MiniFASNetV1SEModel(
     context: Context
-) : BaseFASModel(context), FASModel {
+) : BaseFASModel(context) {
 
+    /* =====================================================
+     * 🔐 MODEL CONTRACT
+     * =====================================================
+     *
+     * English:
+     * These values inform the BaseFASModel
+     * how to interpret and run this model.
+     *
+     * عربي:
+     * هذه القيم تمثل عقد النموذج مع النظام،
+     * وهي ثابتة ولا تتغير أثناء التشغيل.
+     */
+
+    /** Unique identifier for this model */
     override val id: String =
         "minifasnet_v1se_80x80_light"
 
+    /** Model input size: 80 x 80 RGB */
     override val inputSize: Int = 80
 
     /**
-     * Lower threshold compared to V2.
-     * Optimized for speed over maximum security.
+     * Default threshold
+     *
+     * English:
+     * Lower than V2 to favor recall and speed.
+     *
+     * عربي:
+     * عتبة أقل من V2 لتحقيق سرعة أعلى
+     * وتقليل الرفض الخاطئ.
      */
     override val defaultThreshold: Float = 0.80f
 
     /**
-     * GPU is not required and not recommended
+     * GPU is not required nor recommended
      * for this lightweight model.
      */
     override val supportsGpu: Boolean = false
 
+    /** Output tensor mapping:
+     *  index 0 → Spoof
+     *  index 1 → Real */
+    override val realIndex: Int = 1
+    override val spoofIndex: Int = 0
 
+    /** Model outputs logits → requires Softmax */
+    override val requiresSoftmax: Boolean = true
 
+    /** Model is ACTIVE in production */
+    override val isTemporarilyDisabled: Boolean = false
+
+    /* ===================================================== */
+
+    /**
+     * Load TFLite model once during initialization
+     */
     init {
         loadModel("models/fas/minifasnet_v1se_80x80_light.tflite")
     }
 
+    /**
+     * PREPROCESSING
+     *
+     * =====================================================
+     * English:
+     * Converts input face Bitmap into model tensor:
+     * 1. Resize to 80x80
+     * 2. Extract RGB pixel values
+     * 3. Normalize each channel to [-1, 1]
+     * 4. Pack into Float32 ByteBuffer
+     *
+     * ✅ Uses reusable buffers:
+     * - inputBuffer (Float32)
+     * - pixelArray (IntArray)
+     *
+     * ✅ ZERO allocations per frame.
+     *
+     * =====================================================
+     * عربي:
+     * تحويل صورة الوجه إلى Tensor مطابق للنموذج:
+     * 1. تصغير الصورة إلى 80×80
+     * 2. استخراج قيم RGB
+     * 3. تطبيع القيم إلى [-1, 1]
+     * 4. تعبئة البيانات في ByteBuffer
+     *
+     * ✅ بدون أي إنشاء ذاكرة جديد مع كل Frame.
+     */
+    override fun preprocess(bitmap: Bitmap) {
 
-    override fun analyze(faceBitmap: Bitmap): FASResult {
+        // Resize only if needed to avoid unnecessary Bitmap allocation
+        val resized =
+            if (bitmap.width == inputSize && bitmap.height == inputSize) {
+                bitmap
+            } else {
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    inputSize,
+                    inputSize,
+                    true
+                )
+            }
 
-        val resized = resizeBitmap(faceBitmap, inputSize)
-        val inputBuffer = createInputBuffer(inputSize)
-
-        /**
-         * MiniFASNet normalization: [-1, 1]
-         */
-        val pixels = IntArray(inputSize * inputSize)
+        // Extract pixels into the reusable pixel buffer (NO allocation)
         resized.getPixels(
-            pixels,
+            pixelArray,
             0,
             inputSize,
             0,
@@ -76,61 +158,23 @@ class MiniFASNetV1SEModel(
             inputSize
         )
 
-        for (pixel in pixels) {
+        // Prepare input tensor buffer
+        inputBuffer.rewind()
+
+        // Normalize and write RGB values
+        for (pixel in pixelArray) {
             val r = ((pixel shr 16 and 0xFF) - 127.5f) / 127.5f
-            val g = ((pixel shr 8  and 0xFF) - 127.5f) / 127.5f
-            val b = ((pixel        and 0xFF) - 127.5f) / 127.5f
+            val g = ((pixel shr 8 and 0xFF) - 127.5f) / 127.5f
+            val b = ((pixel and 0xFF) - 127.5f) / 127.5f
 
             inputBuffer.putFloat(r)
             inputBuffer.putFloat(g)
             inputBuffer.putFloat(b)
         }
 
-        val output = Array(1) { FloatArray(2) }
-        val startInferenceNs = System.nanoTime()
-        try {
-            interpreter.run(inputBuffer, output)
-        } catch (e: Exception) {
-            return FASResult.Inconclusive(
-                reason = "MiniFASNetV1SE inference failed: ${e.message}"
-            )
-
-
-
-
-        }
-        val inferenceMs =
-            (System.nanoTime() - startInferenceNs) / 1_000_000
-
-        // ✅ تسجيل زمن inference
-        FasRuntimeMetrics.log(
-            modelId = id,
-            useGpu = false,
-            stage = "inference",
-            durationMs = inferenceMs
-        )
-        val spoofLogit = output[0][0]
-        val realLogit  = output[0][1]
-
-        /**
-         * Softmax
-         */
-        val expSpoof = exp(spoofLogit)
-        val expReal  = exp(realLogit)
-        val sum = expSpoof + expReal
-
-        if (sum.isNaN() || sum == 0.0f) {
-            return FASResult.Inconclusive(
-                reason = "Invalid softmax output"
-            )
-        }
-
-        val realProbability = expReal / sum
-
-        return if (realProbability >= defaultThreshold) {
-            FASResult.Real(confidence = realProbability)
-        } else {
-            FASResult.Spoof(confidence = realProbability)
+        // Clean up temporary bitmap if created
+        if (resized !== bitmap) {
+            resized.recycle()
         }
     }
 }

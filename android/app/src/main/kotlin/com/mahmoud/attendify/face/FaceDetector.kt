@@ -2,6 +2,8 @@ package com.mahmoud.attendify.face
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Rect
+import android.util.Log
 import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -12,141 +14,68 @@ import java.nio.channels.FileChannel
  * FaceDetector (BlazeFace)
  *
  * Arabic:
- * كلاس مسؤول عن:
- * - تحميل نموذج BlazeFace
- * - تحويل صورة الكاميرا إلى input مناسب للنموذج
- * - تشغيل Face Detection
+ * كاشف وجه خفيف (BlazeFace)
+ * - مهيأ لاختبارات الصور الثابتة
+ * - Threshold منخفض لتقبّل الصور المطبوعة / الشاشة
  *
  * English:
- * Responsible for:
- * - Loading BlazeFace model
- * - Preparing input tensor
- * - Running face detection inference
+ * Lightweight BlazeFace detector
+ * - Tuned for static image testing
+ * - Lower threshold for printed/screen faces
  */
 class FaceDetector(context: Context) {
 
-    /**
-     * TensorFlow Lite interpreter
-     *
-     * Arabic:
-     * المشغّل الذي ينفّذ النموذج العصبي
-     *
-     * English:
-     * Executes the neural network model
-     */
+    companion object {
+        private const val TAG = "FACE_DETECT"
+    }
+
     private val interpreter: Interpreter
 
-    /**
-     * inputSize
-     *
-     * Arabic:
-     * حجم الصورة الذي يتطلبه نموذج BlazeFace
-     * النموذج لا يهتم بدقة الكاميرا الأصلية
-     *
-     * English:
-     * Required input resolution for BlazeFace model
-     */
+    /** BlazeFace input size */
     private val inputSize = 128
 
     /**
-     * scoreThreshold
-     *
      * Arabic:
-     * حدّ الثقة (Confidence Threshold)
-     * أي كشف أقل من هذه القيمة سيُهمل
+     * Threshold منخفض جدًا للاختبارات الثابتة
      *
      * English:
-     * Confidence threshold for detections
+     * Low threshold for static image detection
      */
-    private val scoreThreshold = 0.85f
-
-    /**
-     * maxFaces
-     *
-     * Arabic:
-     * حد أقصى نظري للوجوه التي نسمح بإحصائها
-     * (للأمان ومنع الضوضاء)
-     *
-     * English:
-     * Maximum allowed detected faces
-     */
-    private val maxFaces = 1
+    private val scoreThreshold = 0.30f
 
     init {
         val model = loadModel(context)
-
         val options = Interpreter.Options().apply {
-            setNumThreads(
-                Runtime.getRuntime()
-                    .availableProcessors()
-                    .coerceAtMost(4)
-            )
+            setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtMost(4))
         }
-
         interpreter = Interpreter(model, options)
     }
 
-    /**
-     * loadModel
-     *
-     * Arabic:
-     * تحميل ملف النموذج من assets
-     *
-     * English:
-     * Load TFLite model from assets
-     */
     private fun loadModel(context: Context): MappedByteBuffer {
-        val fileDescriptor =
-            context.assets.openFd("models/face_detection.tflite")
-        val inputStream = fileDescriptor.createInputStream()
-        val channel = inputStream.channel
-
-        return channel.map(
+        val fd = context.assets.openFd("models/face_detection.tflite")
+        val inputStream = fd.createInputStream()
+        return inputStream.channel.map(
             FileChannel.MapMode.READ_ONLY,
-            fileDescriptor.startOffset,
-            fileDescriptor.declaredLength
+            fd.startOffset,
+            fd.declaredLength
         )
     }
 
     /**
-     * prepareInputBuffer
-     *
-     * Arabic:
-     * تحويل Bitmap إلى Float32 tensor
-     * مع Normalization مناسب لنموذج BlazeFace
-     *
-     * English:
-     * Convert bitmap into Float32 input tensor
+     * Normalize image to [-1,1] Float32
      */
     private fun prepareInputBuffer(bitmap: Bitmap): ByteBuffer {
+        val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
 
-        val resized =
-            Bitmap.createScaledBitmap(
-                bitmap,
-                inputSize,
-                inputSize,
-                true
-            )
-
-        val buffer = ByteBuffer.allocateDirect(
-            inputSize * inputSize * 3 * 4
-        )
+        val buffer = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4)
         buffer.order(ByteOrder.nativeOrder())
 
         for (y in 0 until inputSize) {
             for (x in 0 until inputSize) {
-
                 val pixel = resized.getPixel(x, y)
-
-                buffer.putFloat(
-                    ((pixel shr 16 and 0xFF) - 128) / 128f
-                )
-                buffer.putFloat(
-                    ((pixel shr 8 and 0xFF) - 128) / 128f
-                )
-                buffer.putFloat(
-                    ((pixel and 0xFF) - 128) / 128f
-                )
+                buffer.putFloat(((pixel shr 16 and 0xFF) - 128) / 128f)
+                buffer.putFloat(((pixel shr 8 and 0xFF) - 128) / 128f)
+                buffer.putFloat(((pixel and 0xFF) - 128) / 128f)
             }
         }
 
@@ -155,36 +84,18 @@ class FaceDetector(context: Context) {
     }
 
     /**
-     * detectFaces
-     *
-     * Arabic:
-     * تشغيل النموذج وإرجاع:
-     * 0 = لا يوجد وجه
-     * 1 = يوجد وجه واحد مستقر
-     *
-     * English:
-     * Run inference and return:
-     * 0 = no face
-     * 1 = face detected
+     * Detect the best face and return pixel bounding box
      */
     fun detectBestFace(bitmap: Bitmap): FaceDetection? {
 
         val inputBuffer = prepareInputBuffer(bitmap)
 
-        val locations =
-            Array(1) { Array(896) { FloatArray(16) } }
-
-        val scores =
-            Array(1) { Array(896) { FloatArray(1) } }
-
-        val outputMap = mapOf(
-            0 to locations,   // regressors
-            1 to scores       // classifiers
-        )
+        val locations = Array(1) { Array(896) { FloatArray(16) } }
+        val scores = Array(1) { Array(896) { FloatArray(1) } }
 
         interpreter.runForMultipleInputsOutputs(
             arrayOf(inputBuffer),
-            outputMap
+            mapOf(0 to locations, 1 to scores)
         )
 
         var bestIndex = -1
@@ -198,19 +109,36 @@ class FaceDetector(context: Context) {
             }
         }
 
-        if (bestIndex == -1) return null
+        if (bestIndex == -1) {
+            Log.w(TAG, "No face passed threshold=$scoreThreshold")
+            return null
+        }
 
-        // أول 4 قيم تمثل Bounding Box
-        val rawBox = locations[0][bestIndex].copyOfRange(0, 4)
+        val raw = locations[0][bestIndex]
+
+        // BlazeFace format: center_x, center_y, width, height (normalized)
+        val cx = raw[0] * bitmap.width
+        val cy = raw[1] * bitmap.height
+        val w = raw[2] * bitmap.width
+        val h = raw[3] * bitmap.height
+
+        val left = (cx - w / 2).toInt().coerceAtLeast(0)
+        val top = (cy - h / 2).toInt().coerceAtLeast(0)
+        val right = (cx + w / 2).toInt().coerceAtMost(bitmap.width)
+        val bottom = (cy + h / 2).toInt().coerceAtMost(bitmap.height)
+
+        val box = Rect(left, top, right, bottom)
+
+        Log.d(TAG, "Face detected: score=$bestScore box=$box")
 
         return FaceDetection(
             score = bestScore,
-            box = rawBox
+            box = box
         )
     }
 }
 
 data class FaceDetection(
     val score: Float,
-    val box: FloatArray   // [x, y, w, h]
+    val box: Rect
 )
