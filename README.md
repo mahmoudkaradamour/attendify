@@ -1,201 +1,53 @@
-# Attendify – Secure Face-Based Attendance System
+# 🛡️ Attendify - Enterprise-Grade Biometric Attendance Engine
 
-Attendify is an **enterprise-grade, security-aware face attendance system**
-built with **Android (Kotlin)** and **TensorFlow Lite**.
+![Platform](https://img.shields.io/badge/Platform-Android-3DDC84?logo=android&logoColor=white)
+![Language](https://img.shields.io/badge/Language-Kotlin-7F52FF?logo=kotlin&logoColor=white)
+![Architecture](https://img.shields.io/badge/Architecture-Clean_Architecture-blue)
+![ML](https://img.shields.io/badge/ML-TensorFlow_Lite-FF6F00?logo=tensorflow)
 
-It is designed to replace traditional attendance methods
-(manual signatures, cards, PINs) with a **defensive, auditable,
-and production-ready biometric pipeline**.
-
-> ⚠️ Attendify is designed for sensitive environments.
-> Security, determinism, and auditability are treated as first‑class concerns.
+Attendify is a highly secure, real-time face recognition and anti-spoofing (FAS) engine built natively for Android. Designed for enterprise and mission-critical environments, it ensures deterministic performance, zero-allocation memory management, and military-grade resistance to presentation attacks (spoofing).
 
 ---
 
-## ✨ Key Capabilities
+## ✨ Engineering Highlights & Core Features
 
-- ✅ **Face Anti‑Spoofing (FAS)**
-  - MiniFASNet V1SE (Lightweight & fast)
-  - MiniFASNet V2 (Default, balanced accuracy)
-  - FastFASNet V3 (High‑security mode)
+### 🔒 Zero-Tolerance Anti-Spoofing (Liveness Detection)
+* **Passive FAS (Neural Networks):** Integrates multiple TFLite models (e.g., `MiniFASNet`, `FastFASNetV3`) with dynamic **Scale Expansion** to detect printed photos, screen replays, and cut-out masks by analyzing background context and Moiré patterns.
+* **Active FAS (Metrics Engine):** Real-time tracking of facial metrics (Blink, Smile, Head Yaw/Pitch) to ensure the physical presence of a live subject.
+* **Fail-Secure Architecture:** Strict policy enforcement that explicitly blocks attendance if a high-security model is unavailable, strictly preventing silent security downgrades.
 
-- ✅ **Clean Architecture**
-  - Strict separation between hardware, logic, and policy
-  - Template Method Pattern enforcement
-  - Policy‑driven model selection
-
-- ✅ **Security‑First Design**
-  - Fail‑Secure behavior (no silent downgrade)
-  - Native Core as the single source of truth
-  - Deterministic, versioned model behavior
-
-- ✅ **Real‑Time Performance**
-  - Zero heap allocation during camera streaming
-  - Stable FPS under continuous operation
-  - Controlled thermal behavior on low‑end devices
+### ⚡ High-Performance Native Core
+* **Zero-Allocation Streaming:** Utilizes pre-allocated memory buffers (`IntArray`, `ByteBuffer`) for continuous frame processing. Ensures **30 FPS inference** without triggering Garbage Collection (GC) churn or thermal throttling on low-end devices.
+* **Smart Hardware Acceleration:** Dynamic resolution of GPU vs. CPU (XNNPACK) delegation based on model quantization (INT8 vs Float32) to prevent hardware crashes on legacy chipsets.
+* **Numerical Integrity:** Custom implementation of **Stable Softmax** and **L2 Normalization** to prevent math overflows (NaN/Infinity) and guarantee deterministic cosine similarity.
 
 ---
 
-## 🧠 High‑Level Architecture
+## 🏗️ System Architecture (The Pipeline)
 
-Camera / Hardware Layer
-↓
-Image Quality Checks
-↓
-Face Detection
-↓
-Expanded Face Crop
-↓
-Active / Passive Liveness
-↓
-Face Anti‑Spoofing (FAS)
-↓
-Face Matching
-↓
-Signed Attendance Decision
+Attendify is built strictly on **Clean Architecture** and **Template Method Patterns**, featuring a unidirectional, asynchronous data pipeline that keeps the UI thread entirely free:
 
-### Architectural Principles
-
-- **Native Core decides – UI displays**
-- **Models do not decide – Base classes decide**
-- **Policies select models – models own thresholds**
-
-All ML decision logic is centralized and protected.
+1. **CameraX Input** ➔ Low-overhead YUV frame capturing with early-release memory management.
+2. **Quality Gate** ➔ Discards blurry or poorly lit frames to conserve CPU power.
+3. **BlazeFace Detection** ➔ High-speed face localization.
+4. **Safe Scale Cropper** ➔ Expands the bounding box (e.g., 2.5x) to capture vital physical spoofing context.
+5. **Liveness Orchestrator** ➔ Validates Real vs. Spoof using adaptive, policy-driven FAS models.
+6. **MobileFaceNet Extractor** ➔ Dequantizes INT8 tensors safely into 128-D normalized embeddings.
+7. **Matching Engine** ➔ Compares embeddings using deterministic Cosine Similarity thresholds.
 
 ---
 
-## 🏛️ Core Design Patterns
-
-### ✅ Template Method Pattern
-- Core inference pipeline is `final`
-- Subclasses can only implement preprocessing
-- Prevents security and logic drift
-
-### ✅ Single Source of Truth
-- Softmax
-- Thresholding
-- Decision logic
-- Interpreter lifecycle
-
-All centralized inside the Native Core.
+## 🛠️ Tech Stack & Patterns
+* **Core:** Kotlin, Coroutines, StateFlow (Concurrency)
+* **Camera:** Android CameraX (Hardware Abstraction)
+* **AI / ML:** TensorFlow Lite (C++ Native backend), Google ML Kit
+* **Design Patterns:** Clean Architecture, Template Method Pattern, Orchestrator Pattern, Single Source of Truth.
 
 ---
 
-## 🛡️ Security Model
-
-### Fail‑Secure by Design
-- If a required security model is unavailable → attendance is **blocked**
-- No fallback to weaker models
-
-### Anti‑Spoofing Hardening
-- Expanded face crop preserves background context
-- Strong resistance to:
-  - Printed photo attacks
-  - Screen replay attacks
-
-### Numerical Safety
-- Stable Softmax (overflow / underflow safe)
-- L2 Normalization
-- NaN / Infinity guarded
-
-> The Native Core is intentionally designed as a **defensive stronghold**.
+## 📜 Audit & Compliance
+Features a robust `AttendanceAuditLog` system to track precise inference times, exact hardware delegates used, and detailed rejection reasons. This ensures complete traceability and accountability for enterprise auditing and compliance.
 
 ---
 
-## 📦 Model Management Policy
-
-- ML models are **bundled with the application binary**
-- No automatic OTA model updates
-
-### Rationale
-- Attendance has legal and administrative implications
-- Reproducibility and auditability are mandatory
-- Model version = behavioral version
-
-> OTA model updates are intentionally **deferred by design**
-> and treated as a future architectural decision if the operational context changes.
-
----
-
-## 🚀 Runtime Performance Characteristics
-
-- ✔ Zero heap allocation during inference
-- ✔ Reusable buffers (ByteBuffer & pixel arrays)
-- ✔ Native resources released deterministically
-- ✔ Graceful slowdown (thermal throttling) under long sessions
-- ✔ No Out‑Of‑Memory crashes under sustained usage
-
----
-
-## 🔄 Flutter ↔ Native Communication
-
-- Native Core streams state via **EventChannels**
-- Flutter is **display‑only**
-- No business or security logic in Flutter
-
-Example state stream:
-- `CAMERA_READY`
-- `FACE_TOO_FAR`
-- `HOLD_STILL`
-- `BLINK_NOW`
-- `PROCESSING`
-- `SUCCESS`
-- `FAILED / SPOOF`
-
-> Zero‑Trust rule: **Flutter is never trusted with decisions**.
-
----
-
-## 🔐 Backend Trust Model (Recommended)
-
-- Native Core produces attendance result
-- Result is **cryptographically signed**
-- Backend accepts **only signed native payloads**
-- Prevents replay and UI‑level tampering
-
----
-
-## 🧪 Testing & Validation
-
-- Static image test harness for FAS models
-- Deterministic inference results
-- Field‑testing oriented design
-
-### Recommended Pre‑Deployment Tests
-- Low‑light environments
-- Continuous camera operation (≥ 30 minutes)
-- Users wearing glasses or masks
-- Strong backlight scenarios
-
----
-
-## ✅ Production Readiness Status
-
-- ✔ Architecture review: **PASSED**
-- ✔ Security audit: **PASSED**
-- ✔ Memory & performance review: **PASSED**
-- ✔ Silent downgrade risks: **ELIMINATED**
-
-**Current Status:** ✅ **Production‑Ready**
-
----
-
-## 📌 Guidelines for Future Contributors
-
-- Do not modify core inference logic without review
-- All new FAS models must:
-  - Extend `BaseFASModel`
-  - Implement preprocessing only
-- Any weakening of security guarantees
-  is considered a **breaking change**
-
----
-
-## 📄 License & Usage
-
-This repository is intended for controlled,
-enterprise, or internal deployment.
-
-Licensing and redistribution rules
-are defined by the owning organization.
-
+*Built with strict engineering discipline. Ready for Production.*
