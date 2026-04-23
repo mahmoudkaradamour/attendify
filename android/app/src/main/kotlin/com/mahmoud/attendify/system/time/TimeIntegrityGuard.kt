@@ -7,9 +7,14 @@ import kotlin.math.abs
 /**
  * TimeIntegrityGuard
  *
- * The single authority responsible for validating device time integrity.
+ * The single and final authority responsible for validating
+ * device time integrity for attendance operations.
  *
- * Any attendance operation MUST call this guard before proceeding.
+ * SECURITY GUARANTEES:
+ * - No attendance without a valid anchor
+ * - No offline attendance after device reboot
+ * - No cumulative drift (anchor-based comparison only)
+ * - Fail-secure behavior for all invalid states
  */
 class TimeIntegrityGuard(
     private val context: Context,
@@ -18,20 +23,35 @@ class TimeIntegrityGuard(
 ) {
 
     /**
-     * Main entry point.
+     * Validates current device time integrity.
      *
-     * @param previousSnapshot Last trusted time snapshot (may be null).
+     * NOTE:
+     * - previousSnapshot is intentionally NOT used for drift calculation.
+     * - All drift checks are performed against the immutable AnchorRecord.
      */
-    fun validate(previousSnapshot: TimeSnapshot?): TimeIntegrityResult {
+    fun validate(): TimeIntegrityResult {
 
-        // 1️⃣ Mandatory initial handshake (Anchor)
+        // --------------------------------------------------
+        // 1️⃣ Mandatory Initial Handshake (Anchor Presence)
+        // --------------------------------------------------
         if (policy.requireInitialAnchor && !anchorStorage.hasAnchor()) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.INITIAL_ANCHOR_REQUIRED
             )
         }
 
-        // 2️⃣ Mandatory time sync checks
+        // Anchor MUST exist beyond this point
+        val anchor = try {
+            anchorStorage.loadAnchor()
+        } catch (e: Exception) {
+            return TimeIntegrityResult.Blocked(
+                TimeIntegrityResult.Reason.INITIAL_ANCHOR_REQUIRED
+            )
+        }
+
+        // --------------------------------------------------
+        // 2️⃣ Mandatory System Time Settings
+        // --------------------------------------------------
         if (!isAutoTimeEnabled()) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.AUTO_TIME_DISABLED
@@ -44,50 +64,53 @@ class TimeIntegrityGuard(
             )
         }
 
-        // 3️⃣ Capture current snapshot atomically
+        // --------------------------------------------------
+        // 3️⃣ Capture Atomic Current Snapshot
+        // --------------------------------------------------
         val current = TimeSource.snapshot()
 
-        // 4️⃣ Timezone policy gate
+        // --------------------------------------------------
+        // 4️⃣ Timezone Policy Gate
+        // --------------------------------------------------
         if (current.timeZoneId != policy.requiredTimeZone) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.TIMEZONE_MISMATCH
             )
         }
 
-        // 5️⃣ First record after anchor (no delta yet)
-        if (previousSnapshot == null) {
-            return TimeIntegrityResult.OK
+        // --------------------------------------------------
+        // 5️⃣ REBOOT BLACKHOLE FIX
+        // --------------------------------------------------
+        // New boot = unanchored physical timeline
+        // Offline attendance is FORBIDDEN until a new anchor is created online
+        if (current.bootId != anchor.bootId) {
+            return TimeIntegrityResult.Blocked(
+                TimeIntegrityResult.Reason.INITIAL_ANCHOR_REQUIRED
+            )
         }
 
-        // 6️⃣ Reboot handling (boot ID changed)
-        if (current.bootId != previousSnapshot.bootId) {
-            if (!policy.allowPostBootRecords) {
-                return TimeIntegrityResult.Blocked(
-                    TimeIntegrityResult.Reason.CLOCK_DRIFT_DETECTED
-                )
-            }
-            // Allowed by policy – but flagged later in Attendance Proof
-            return TimeIntegrityResult.OK
-        }
-
-        // 7️⃣ Time Drift Detection (core security rule)
-        val deltaWall = current.wallClockMillis - previousSnapshot.wallClockMillis
-        val deltaElapsed =
-            current.elapsedRealtimeMillis - previousSnapshot.elapsedRealtimeMillis
+        // --------------------------------------------------
+        // 6️⃣ ANCHOR-BASED DRIFT DETECTION (NO ACCUMULATION)
+        // --------------------------------------------------
+        val deltaWall = current.wallClockMillis - anchor.wallClockMillis
+        val deltaElapsed = current.elapsedRealtimeMillis - anchor.elapsedRealtimeMillis
 
         val drift = abs(deltaWall - deltaElapsed)
 
-        return if (drift > policy.driftToleranceMillis) {
-            TimeIntegrityResult.Tampered(
-                details = "Clock drift exceeded tolerance: ${drift}ms"
+        if (drift > policy.driftToleranceMillis) {
+            return TimeIntegrityResult.Tampered(
+                details = "Anchor-based clock drift exceeded tolerance: ${drift}ms"
             )
-        } else {
-            TimeIntegrityResult.OK
         }
+
+        // --------------------------------------------------
+        // ✅ All checks passed
+        // --------------------------------------------------
+        return TimeIntegrityResult.OK
     }
 
     // --------------------------------------------------
-    // System checks
+    // System configuration checks
     // --------------------------------------------------
 
     private fun isAutoTimeEnabled(): Boolean {
