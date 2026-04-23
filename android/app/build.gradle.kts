@@ -120,4 +120,10 @@ dependencies {
      * ========================================================= */
 
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Networking (Server Time Handshake)
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // JSON parsing
+    implementation("org.json:json:20231013")
 }
