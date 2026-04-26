@@ -2,7 +2,6 @@ package com.mahmoud.attendify.attendance.usecase
 
 import com.mahmoud.attendify.attendance.domain.AttendanceAction
 import com.mahmoud.attendify.attendance.domain.AttendanceResult
-import com.mahmoud.attendify.attendance.domain.Justification
 import com.mahmoud.attendify.system.location.LocationIntegrityGuard
 import com.mahmoud.attendify.system.location.LocationIntegrityResult
 import com.mahmoud.attendify.system.time.AttendanceTimeProofFactory
@@ -18,13 +17,19 @@ import com.mahmoud.attendify.system.time.working.WorkingTimeEvidence
 /**
  * AttendanceUseCase
  *
- * Central orchestrator for attendance operations.
+ * Central decision unit for attendance operations.
  *
  * DECISION FLOW:
- * 1) Time Integrity       (security)
+ * --------------
+ * 1) Time Integrity        (security)
  * 2) Working Time Policy  (administrative)
- * 3) Location Integrity  (context)
- * 4) Aggregate justification
+ * 3) Location Integrity   (contextual)
+ * 4) Evidence aggregation
+ *
+ * NOTE:
+ * -----
+ * This class does NOT know about UI or Flutter.
+ * It receives all required context explicitly.
  */
 class AttendanceUseCase(
 
@@ -40,11 +45,24 @@ class AttendanceUseCase(
     private val workingTimeEvaluator: WorkingTimeEvaluator?
 ) {
 
+    /**
+     * attempt
+     *
+     * Executes the full administrative attendance decision
+     * after biometric verification has succeeded.
+     *
+     * @param action            CHECK_IN or CHECK_OUT
+     * @param livenessExecuted  Whether liveness was executed during this attempt
+     */
     fun attempt(
-        action: AttendanceAction
+        action: AttendanceAction,
+        livenessExecuted: Boolean
     ): AttendanceResult {
 
-        /* 1️⃣ TIME INTEGRITY */
+        /* ==================================================
+         * 1️⃣ TIME INTEGRITY
+         * ==================================================
+         */
         val timeResult = timeIntegrityGuard.validate()
 
         if (
@@ -57,10 +75,16 @@ class AttendanceUseCase(
             )
         }
 
-        /* 2️⃣ TRUSTED TIME SNAPSHOT */
+        /* ==================================================
+         * 2️⃣ TRUSTED TIME SNAPSHOT
+         * ==================================================
+         */
         val timeSnapshot = TimeSource.snapshot()
 
-        /* 3️⃣ WORKING TIME POLICY */
+        /* ==================================================
+         * 3️⃣ WORKING TIME POLICY
+         * ==================================================
+         */
         val workingTimeDecision =
             workingTimeEvaluator?.evaluate(timeSnapshot.toInstant())
 
@@ -73,7 +97,10 @@ class AttendanceUseCase(
             )
         }
 
-        /* 4️⃣ CREATE TIME PROOF */
+        /* ==================================================
+         * 4️⃣ CREATE TIME PROOF
+         * ==================================================
+         */
         val timeProof = timeProofFactory.create(
             currentSnapshot = timeSnapshot,
             integrityResult = timeResult
@@ -81,7 +108,10 @@ class AttendanceUseCase(
 
         timeAnchorStorage.saveAnchor(timeSnapshot)
 
-        /* 5️⃣ LOCATION INTEGRITY */
+        /* ==================================================
+         * 5️⃣ LOCATION INTEGRITY
+         * ==================================================
+         */
         val locationResult = locationIntegrityGuard.evaluate()
 
         if (locationResult is LocationIntegrityResult.Blocked) {
@@ -93,7 +123,10 @@ class AttendanceUseCase(
         val locationEvidence =
             (locationResult as LocationIntegrityResult.Allowed).evidence
 
-        /* 6️⃣ JUSTIFICATION AGGREGATION */
+        /* ==================================================
+         * 6️⃣ JUSTIFICATION & EVIDENCE AGGREGATION
+         * ==================================================
+         */
         val justificationRequired =
             locationEvidence.justificationRequired ||
                     (workingTimeDecision?.action ==
@@ -110,19 +143,17 @@ class AttendanceUseCase(
                 )
             }
 
-        /* 7️⃣ ACCEPTED (PHASE‑1) */
+        /* ==================================================
+         * 7️⃣ ACCEPTED (PHASE‑1 FINAL)
+         * ==================================================
+         */
         return AttendanceResult.Accepted(
             action = action,
             timeProof = timeProof,
             locationEvidence = locationEvidence,
             workingTimeEvidence = workingTimeEvidence,
+            livenessExecuted = livenessExecuted,
             justification = if (justificationRequired) null else null
         )
     }
-
-    fun finalizeWithJustification(
-        accepted: AttendanceResult.Accepted,
-        justification: Justification
-    ): AttendanceResult.Accepted =
-        accepted.copy(justification = justification)
 }

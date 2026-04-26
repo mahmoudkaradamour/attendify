@@ -1,17 +1,23 @@
 package com.mahmoud.attendify.attendance.orchestration
 
 import android.graphics.Bitmap
+import java.util.concurrent.atomic.AtomicBoolean
+
 import com.mahmoud.attendify.attendance.domain.AttendanceAction
 import com.mahmoud.attendify.attendance.domain.AttendanceResult
 import com.mahmoud.attendify.attendance.usecase.AttendanceUseCase
+
 import com.mahmoud.attendify.camera.ImageQualityChecker
 import com.mahmoud.attendify.camera.SystemStatus
+
 import com.mahmoud.attendify.face.FaceCropper
 import com.mahmoud.attendify.face.FaceDetector
 import com.mahmoud.attendify.face.MobileFaceNet
+
 import com.mahmoud.attendify.liveness.LivenessOrchestrator
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
 import com.mahmoud.attendify.liveness.result.LivenessResult
+
 import com.mahmoud.attendify.matching.FaceMatchingUseCase
 import com.mahmoud.attendify.matching.MatchDecision
 
@@ -20,25 +26,21 @@ import com.mahmoud.attendify.matching.MatchDecision
  *
  * PURPOSE:
  * --------
- * Executes the full runtime attendance pipeline using a SINGLE input image:
+ * Executes the full runtime attendance pipeline using a SINGLE input image.
  *
- *   Image
- *     → Image Quality Check
- *     → Face Detection
- *     → Face Crop
- *     → (Optional) Liveness
- *     → Face Embedding
- *     → Face Matching
- *     → AttendanceUseCase (time / location / working time)
+ * SECURITY & ARCHITECTURE GUARANTEES:
+ * ----------------------------------
+ * - No policy definition
+ * - No persistence
+ * - Fail-fast on first blocking condition
+ * - No UI / Flutter knowledge
+ * - Deterministic & auditable execution path
  *
- * IMPORTANT ARCHITECTURAL RULES:
- * ------------------------------
- * - This class does NOT define policies
- * - This class does NOT perform persistence
- * - This class does NOT know about Flutter or UI
- * - This class FAILS FAST on the first blocking condition
- *
- * This is a pure orchestration (glue) layer.
+ * NOTE:
+ * -----
+ * This class is intentionally procedural and explicit.
+ * Future evolution toward Chain-of-Responsibility is prepared
+ * via dedicated interceptor abstractions (outside this file).
  */
 class AttendanceRuntimeOrchestrator(
 
@@ -58,6 +60,12 @@ class AttendanceRuntimeOrchestrator(
 ) {
 
     /**
+     * Guards against concurrent / repeated execution
+     * (Double-tap, race conditions, slow devices).
+     */
+    private val isProcessing = AtomicBoolean(false)
+
+    /**
      * attemptAttendance
      *
      * Entry point for a full attendance attempt using one bitmap.
@@ -75,98 +83,131 @@ class AttendanceRuntimeOrchestrator(
     ): AttendanceResult {
 
         /* ==================================================
-         * 1️⃣ IMAGE QUALITY GATE
+         * 🔒 CONCURRENCY GUARD
          * ==================================================
-         * Prevents unusable frames from entering ML pipeline.
+         * Prevents multiple concurrent attendance executions.
          */
-        val imageStatus = ImageQualityChecker.checkFrame(frameBitmap)
-        if (imageStatus != SystemStatus.OK) {
+        if (!isProcessing.compareAndSet(false, true)) {
             return AttendanceResult.Blocked(
-                reason = "Image quality check failed: $imageStatus"
+                reason = "Attendance already in progress"
             )
         }
 
-        /* ==================================================
-         * 2️⃣ FACE DETECTION
-         * ==================================================
-         * Detect ONE best face only.
-         */
-        val detection = faceDetector.detectBestFace(frameBitmap)
-            ?: return AttendanceResult.Blocked(
-                reason = "No face detected"
-            )
+        try {
 
-        /* ==================================================
-         * 3️⃣ FACE CROP (SECURITY‑AWARE, EXPANDED)
-         * ==================================================
-         * Uses expanded crop to preserve background for FAS.
-         */
-        val faceBitmap = FaceCropper.cropAndResize(
-            sourceBitmap = frameBitmap,
-            faceBox = detection.box,
-            targetSize = 112 // MobileFaceNet input
-        ) ?: return AttendanceResult.Blocked(
-            reason = "Face crop failed"
-        )
-
-        /* ==================================================
-         * 4️⃣ LIVENESS (OPTIONAL, POLICY‑DRIVEN)
-         * ==================================================
-         * If disabled by policy → skipped safely.
-         */
-        if (livenessOrchestrator != null) {
-            val metricsFrame =
-                facialMetricsEngine.computeFrameFromBitmap(faceBitmap)
-
-            livenessOrchestrator.onFrame(metricsFrame)
-
-            val livenessResult = livenessOrchestrator.evaluate()
-            if (livenessResult is LivenessResult.SpoofDetected) {
+            /* ==================================================
+             * 1️⃣ IMAGE QUALITY GATE
+             * ==================================================
+             * Prevents unusable frames from entering ML pipeline.
+             */
+            val imageStatus = ImageQualityChecker.checkFrame(frameBitmap)
+            if (imageStatus != SystemStatus.OK) {
                 return AttendanceResult.Blocked(
-                    reason = "Liveness check failed"
+                    reason = "Image quality check failed: $imageStatus"
                 )
             }
-        }
 
-        /* ==================================================
-         * 5️⃣ FACE EMBEDDING
-         * ==================================================
-         * Generates normalized embedding vector.
-         */
-        val embedding = try {
-            faceNet.getEmbedding(faceBitmap)
-        } catch (e: Exception) {
-            return AttendanceResult.Blocked(
-                reason = "Face embedding extraction failed"
+            /* ==================================================
+             * 2️⃣ FACE DETECTION
+             * ==================================================
+             * Detect ONE best face only.
+             * Security assumption: detector must not accept
+             * ambiguous or unstable detections.
+             */
+            val detection = faceDetector.detectBestFace(frameBitmap)
+                ?: return AttendanceResult.Blocked(
+                    reason = "No face detected"
+                )
+
+            /* ==================================================
+             * 3️⃣ FACE CROP (SECURITY‑AWARE, EXPANDED)
+             * ==================================================
+             * Uses expanded crop to preserve background for FAS.
+             */
+            val faceBitmap = FaceCropper.cropAndResize(
+                sourceBitmap = frameBitmap,
+                faceBox = detection.box,
+                targetSize = 112 // MobileFaceNet input
+            ) ?: return AttendanceResult.Blocked(
+                reason = "Face crop failed"
             )
-        }
 
-        /* ==================================================
-         * 6️⃣ FACE MATCHING
-         * ==================================================
-         * Delegates ALL decision logic to matching layer.
-         */
-        val matchDecision = faceMatchingUseCase.matchNow(
-            liveEmbedding = embedding,
-            employeeId = employeeId
-        )
+            /* ==================================================
+             * 4️⃣ LIVENESS (OPTIONAL, POLICY‑DRIVEN)
+             * ==================================================
+             * Executed only if enabled by policy.
+             * Execution state is tracked explicitly for audit.
+             */
+            val livenessExecuted = livenessOrchestrator != null
 
-        when (matchDecision) {
-            is MatchDecision.MatchSuccess -> {
-                // continue
+            if (livenessOrchestrator != null) {
+
+                val metricsFrame =
+                    facialMetricsEngine.computeFrameFromBitmap(faceBitmap)
+
+                livenessOrchestrator.onFrame(metricsFrame)
+
+                val livenessResult = livenessOrchestrator.evaluate()
+                if (livenessResult is LivenessResult.SpoofDetected) {
+                    return AttendanceResult.Blocked(
+                        reason = "Liveness check failed"
+                    )
+                }
             }
-            else -> {
+
+            /* ==================================================
+             * 5️⃣ FACE EMBEDDING
+             * ==================================================
+             * Generates normalized embedding vector.
+             */
+            val embedding = try {
+                faceNet.getEmbedding(faceBitmap)
+            } catch (e: Exception) {
                 return AttendanceResult.Blocked(
-                    reason = "Face matching failed"
+                    reason = "Face embedding extraction failed"
                 )
             }
-        }
 
-        /* ==================================================
-         * 7️⃣ ADMINISTRATIVE ATTENDANCE DECISION
-         * ==================================================
-         * Time / Location / Working Time.
-         */
-        return attendanceUseCase.attempt(action)
+            /* ==================================================
+             * 6️⃣ FACE MATCHING
+             * ==================================================
+             * Delegates ALL decision logic to matching layer.
+             */
+            val matchDecision = faceMatchingUseCase.matchNow(
+                liveEmbedding = embedding,
+                employeeId = employeeId
+            )
+
+            when (matchDecision) {
+                is MatchDecision.MatchSuccess -> {
+                    // continue
+                }
+                else -> {
+                    return AttendanceResult.Blocked(
+                        reason = "Face matching failed"
+                    )
+                }
+            }
+
+            /* ==================================================
+             * 7️⃣ ADMINISTRATIVE ATTENDANCE DECISION
+             * ==================================================
+             * Time / Location / Working Time.
+             *
+             * NOTE:
+             * livenessExecuted is propagated for forensic audit.
+             */
+            return attendanceUseCase.attempt(
+                action = action,
+                livenessExecuted = livenessExecuted
+            )
+
+        } finally {
+            /* ==================================================
+             * 🔓 RELEASE CONCURRENCY GUARD
+             * ==================================================
+             */
+            isProcessing.set(false)
+        }
     }
 }

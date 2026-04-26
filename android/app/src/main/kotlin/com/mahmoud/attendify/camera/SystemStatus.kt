@@ -19,6 +19,7 @@ enum class SystemStatus {
     FRAME_CORRUPTED,
     FACE_TOO_FAR,
     FACE_TOO_CLOSE,
+    MULTIPLE_FACES_DETECTED,
 
     // ✅ Camera / Permission
     CAMERA_BUSY,

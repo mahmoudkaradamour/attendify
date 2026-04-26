@@ -24,6 +24,7 @@ sealed class AttendanceResult {
         val timeProof: AttendanceTimeProof,
         val locationEvidence: LocationEvidence?,
         val workingTimeEvidence: WorkingTimeEvidence?,
+        val livenessExecuted: Boolean, // ✅ NEW
         val justification: Justification? = null
     ) : AttendanceResult()
 
