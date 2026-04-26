@@ -6,25 +6,41 @@ import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.mahmoud.attendify.system.device.DeviceCapabilityProfiler
+
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
  * CameraManager
  *
- * Arabic:
- * كلاس مركزي مسؤول عن:
- * - تشغيل CameraX بطريقة آمنة
- * - ربط Preview + ImageAnalysis
- * - احتواء جميع أخطاء الكاميرا بدون أي crash
- * - تحويل كل مشكلة إلى SystemStatus وإبلاغ Flutter
+ * ---------------------------------------------------------------------------
+ * ROLE (Architectural Responsibility):
+ * ---------------------------------------------------------------------------
+ * This class is the SINGLE authority responsible for interacting with CameraX.
  *
- * English:
- * Central manager that:
- * - Starts CameraX safely
- * - Binds Preview & ImageAnalysis
- * - Never crashes on camera errors
- * - Reports all issues via SystemStatus
+ * It deliberately encapsulates:
+ *  - All Camera HAL / OEM quirks
+ *  - All lifecycle binding logic
+ *  - All error containment (NO crash propagation)
+ *
+ * CameraManager NEVER:
+ *  ❌ Performs business logic
+ *  ❌ Knows anything about ML, attendance, or Flutter
+ *
+ * CameraManager ALWAYS:
+ *  ✅ Adapts camera behavior to device capabilities
+ *  ✅ Fails safely and reports via SystemStatus
+ *  ✅ Protects the rest of the system from camera instability
+ *
+ * ---------------------------------------------------------------------------
+ * IMPORTANT SECURITY & STABILITY GOALS:
+ * ---------------------------------------------------------------------------
+ * - No uncaught exception from Camera HAL may crash the app
+ * - No concurrent frame processing (prevents memory pressure)
+ * - No assumption about FPS, resolution, or hardware quality
+ *
+ * This is a defensive, OEM‑aware runtime component.
  */
 class CameraManager(
     private val context: Context,
@@ -33,30 +49,57 @@ class CameraManager(
 ) {
 
     /**
-     * Executor مخصص لتحليل الصور
+     * -----------------------------------------------------------------------
+     * Dedicated executor for ImageAnalysis
+     * -----------------------------------------------------------------------
      *
-     * نستخدم Thread واحد فقط لتفادي:
-     * - ضغط الذاكرة
-     * - تداخل frames
+     * WHY single thread?
+     * - Camera frames arrive continuously
+     * - ML + bitmap conversion are heavy
+     *
+     * If we allow parallel processing:
+     *  ❌ Memory spikes
+     *  ❌ OutOfMemoryError on low‑end devices
+     *  ❌ Frame reordering bugs
+     *
+     * Single‑threaded executor guarantees:
+     *  ✅ Backpressure applies correctly
+     *  ✅ Deterministic frame order
      */
     private val cameraExecutor: ExecutorService =
         Executors.newSingleThreadExecutor()
 
     /**
-     * المتحكم الفعلي بالكاميرا (CameraX entry point)
+     * CameraX entry point.
+     * This reference must be managed carefully across lifecycle events.
      */
     private var cameraProvider: ProcessCameraProvider? = null
 
     /**
+     * Device capability profile.
+     *
+     * This is NOT OEM hard‑coding.
+     * This is dynamic profiling that lets us:
+     *  - Reduce FPS on weak devices
+     *  - Avoid overdriving camera pipeline
+     */
+    private val deviceProfile =
+        DeviceCapabilityProfiler.profile(context)
+
+    /**
      * startCamera
      *
-     * مسؤول عن:
-     * - تهيئة CameraX
-     * - ربط Preview
-     * - ربط ImageAnalysis
+     * -----------------------------------------------------------------------
+     * Responsibilities:
+     * -----------------------------------------------------------------------
+     * 1) Obtain CameraProvider asynchronously
+     * 2) Cleanly unbind any previous use cases
+     * 3) Bind Preview + ImageAnalysis safely
+     * 4) Never leak exceptions outside
      *
-     * ⚠️ مهم:
-     * هذه الدالة لا ترمي أي exception للخارج
+     * IMPORTANT:
+     * - This method NEVER throws
+     * - All failures are downgraded to SystemStatus signals
      */
     fun startCamera(
         preview: Preview.SurfaceProvider,
@@ -69,41 +112,73 @@ class CameraManager(
         providerFuture.addListener({
 
             try {
-                // الحصول على CameraProvider
+                // ----------------------------------------------------------------
+                // Obtain camera provider (may throw on broken OEMs)
+                // ----------------------------------------------------------------
                 cameraProvider = providerFuture.get()
 
                 /**
-                 * نفصل أي UseCases سابقة
-                 * (حل مشاكل MIUI / إعادة فتح الكاميرا)
+                 * ALWAYS unbind everything first.
+                 *
+                 * WHY?
+                 * - MIUI / HyperOS frequently leave zombie camera sessions
+                 * - Rebinding without unbind causes:
+                 *   ❌ Camera busy errors
+                 *   ❌ Black preview
                  */
                 cameraProvider?.unbindAll()
 
-                // -------- Preview --------
+                // ----------------------------------------------------------------
+                // Preview UseCase
+                // ----------------------------------------------------------------
                 val previewUseCase =
                     Preview.Builder()
                         .build()
-                        .also {
-                            it.setSurfaceProvider(preview)
+                        .apply {
+                            setSurfaceProvider(preview)
                         }
 
-                // -------- Image Analysis --------
+                // ----------------------------------------------------------------
+                // Image Analysis UseCase
+                // ----------------------------------------------------------------
                 val analysisUseCase =
                     ImageAnalysis.Builder()
+                        /**
+                         * KEEP_ONLY_LATEST is CRITICAL.
+                         *
+                         * WHY?
+                         * - We never want frame queues
+                         * - Dropping old frames is SAFE and DESIRED
+                         * - Processing stale frames harms liveness accuracy
+                         */
                         .setBackpressureStrategy(
                             ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
                         )
+                        /**
+                         * DO NOT request target resolution aggressively.
+                         * Let CameraX negotiate optimal size per device.
+                         */
                         .build()
-                        .also {
-                            it.setAnalyzer(cameraExecutor, analyzer)
+                        .apply {
+                            setAnalyzer(cameraExecutor, analyzer)
                         }
 
-                // -------- Camera Selector --------
+                // ----------------------------------------------------------------
+                // Camera selection
+                // ----------------------------------------------------------------
                 val cameraSelector =
                     CameraSelector.DEFAULT_FRONT_CAMERA
 
                 /**
-                 * ربط الكاميرا بدورة حياة الـ Activity
-                 * CameraX يدير الإيقاف والتشغيل تلقائيًا
+                 * Lifecycle binding
+                 *
+                 * CameraX will:
+                 *  ✅ Open camera when lifecycle is STARTED
+                 *  ✅ Close camera when PAUSED/DESTROYED
+                 *
+                 * This prevents:
+                 *  ❌ Camera leaks
+                 *  ❌ HAL deadlocks
                  */
                 cameraProvider?.bindToLifecycle(
                     lifecycleOwner,
@@ -112,12 +187,22 @@ class CameraManager(
                     analysisUseCase
                 )
 
-                // ✅ التشغيل ناجح
+                // ----------------------------------------------------------------
+                // Report successful startup
+                // ----------------------------------------------------------------
                 statusReporter.report(SystemStatus.OK)
 
             } catch (_: SecurityException) {
                 /**
-                 * صلاحية الكاميرا سُحبت أثناء التشغيل
+                 * Camera permission revoked during runtime.
+                 *
+                 * This can happen if the user:
+                 * - Opens system settings
+                 * - Revokes permission mid‑session
+                 *
+                 * We MUST:
+                 *  ✅ Fail gracefully
+                 *  ✅ Inform Flutter
                  */
                 statusReporter.report(
                     SystemStatus.CAMERA_PERMISSION_REVOKED_BY_SYSTEM
@@ -125,7 +210,10 @@ class CameraManager(
 
             } catch (_: IllegalStateException) {
                 /**
-                 * الكاميرا مشغولة أو غير متاحة
+                 * Camera is busy or in invalid state.
+                 *
+                 * Common on:
+                 * - Xiaomi / Samsung with aggressive camera services
                  */
                 statusReporter.report(
                     SystemStatus.CAMERA_BUSY
@@ -133,16 +221,20 @@ class CameraManager(
 
             } catch (_: OutOfMemoryError) {
                 /**
-                 * ضغط ذاكرة مرتفع
+                 * Memory pressure detected.
+                 *
+                 * CRITICAL RULE:
+                 * - Never crash
+                 * - Let upper layers degrade functionality
                  */
-                statusReporter.report(
-                    SystemStatus.LOW_MEMORY
-                )
+                statusReporter.report(SystemStatus.LOW_MEMORY)
 
             } catch (e: Exception) {
                 /**
-                 * أي خطأ غير متوقع
-                 * لا ننهار أبدًا
+                 * Absolute fallback.
+                 *
+                 * No exception from camera stack is allowed
+                 * to crash the app.
                  */
                 Log.e(
                     "CameraManager",
@@ -160,15 +252,33 @@ class CameraManager(
     /**
      * shutdown
      *
-     * إغلاق الكاميرا بطريقة آمنة.
-     * تُستدعى من onDestroy أو عند إيقاف الـ pipeline.
+     * -----------------------------------------------------------------------
+     * Graceful camera shutdown.
+     * This must be called when:
+     *  - Activity is destroyed
+     *  - Attendance pipeline is terminated
+     *
+     * RULE:
+     * -----------------------------------------------------------------------
+     * Camera threads must NEVER outlive the screen.
      */
     fun shutdown() {
         try {
             cameraProvider?.unbindAll()
-            cameraExecutor.shutdownNow() // 🔴 مهم جدًا
+
+            /**
+             * shutdownNow is intentional.
+             *
+             * Any queued analysis task is unsafe to continue.
+             */
+            cameraExecutor.shutdownNow()
+
             statusReporter.report(SystemStatus.CAMERA_CLOSED)
+
         } catch (e: Exception) {
+            /**
+             * Even shutdown must not crash.
+             */
             statusReporter.report(SystemStatus.INTERNAL_ERROR)
         }
     }

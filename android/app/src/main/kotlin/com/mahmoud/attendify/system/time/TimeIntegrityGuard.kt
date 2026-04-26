@@ -7,14 +7,16 @@ import kotlin.math.abs
 /**
  * TimeIntegrityGuard
  *
- * The single and final authority responsible for validating
- * device time integrity for attendance operations.
+ * ============================================================================
+ * ROLE (Architectural Responsibility):
+ * ============================================================================
+ * The single and final authority responsible for validating device time
+ * integrity for attendance decisions.
  *
- * SECURITY GUARANTEES:
- * - No attendance without a valid anchor
- * - No offline attendance after device reboot
- * - No cumulative drift (anchor-based comparison only)
- * - Fail-secure behavior for all invalid states
+ * All validation is:
+ * - Anchor‑based
+ * - Stateless per invocation
+ * - Fail‑secure on ambiguity
  */
 class TimeIntegrityGuard(
     private val context: Context,
@@ -23,35 +25,34 @@ class TimeIntegrityGuard(
 ) {
 
     /**
-     * Validates current device time integrity.
+     * validate
      *
-     * NOTE:
-     * - previousSnapshot is intentionally NOT used for drift calculation.
-     * - All drift checks are performed against the immutable AnchorRecord.
+     * Validates device time integrity at the exact moment of attendance.
+     *
+     * @return TimeIntegrityResult.OK / Blocked / Tampered
      */
     fun validate(): TimeIntegrityResult {
 
-        // --------------------------------------------------
-        // 1️⃣ Mandatory Initial Handshake (Anchor Presence)
-        // --------------------------------------------------
+        /* ================================================================
+         * 1️⃣ INITIAL ANCHOR REQUIREMENT
+         * ================================================================ */
         if (policy.requireInitialAnchor && !anchorStorage.hasAnchor()) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.INITIAL_ANCHOR_REQUIRED
             )
         }
 
-        // Anchor MUST exist beyond this point
         val anchor = try {
             anchorStorage.loadAnchor()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.INITIAL_ANCHOR_REQUIRED
             )
         }
 
-        // --------------------------------------------------
-        // 2️⃣ Mandatory System Time Settings
-        // --------------------------------------------------
+        /* ================================================================
+         * 2️⃣ SYSTEM TIME CONFIGURATION CHECKS
+         * ================================================================ */
         if (!isAutoTimeEnabled()) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.AUTO_TIME_DISABLED
@@ -64,54 +65,69 @@ class TimeIntegrityGuard(
             )
         }
 
-        // --------------------------------------------------
-        // 3️⃣ Capture Atomic Current Snapshot
-        // --------------------------------------------------
+        /* ================================================================
+         * 3️⃣ CURRENT ATOMIC TIME SNAPSHOT
+         * ================================================================ */
         val current = TimeSource.snapshot()
 
-        // --------------------------------------------------
-        // 4️⃣ Timezone Policy Gate
-        // --------------------------------------------------
+        /* ================================================================
+         * 4️⃣ TIMEZONE POLICY ENFORCEMENT
+         * ================================================================ */
         if (current.timeZoneId != policy.requiredTimeZone) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.TIMEZONE_MISMATCH
             )
         }
 
-        // --------------------------------------------------
-        // 5️⃣ REBOOT BLACKHOLE FIX
-        // --------------------------------------------------
-        // New boot = unanchored physical timeline
-        // Offline attendance is FORBIDDEN until a new anchor is created online
+        /* ================================================================
+         * 5️⃣ REBOOT PROTECTION
+         * ================================================================ */
         if (current.bootId != anchor.bootId) {
             return TimeIntegrityResult.Blocked(
                 TimeIntegrityResult.Reason.INITIAL_ANCHOR_REQUIRED
             )
         }
 
-        // --------------------------------------------------
-        // 6️⃣ ANCHOR-BASED DRIFT DETECTION (NO ACCUMULATION)
-        // --------------------------------------------------
-        val deltaWall = current.wallClockMillis - anchor.wallClockMillis
-        val deltaElapsed = current.elapsedRealtimeMillis - anchor.elapsedRealtimeMillis
+        /* ================================================================
+         * 6️⃣ ANCHOR‑BASED DRIFT DETECTION (DYNAMIC TOLERANCE)
+         * ================================================================ */
+        val deltaWall =
+            current.wallClockMillis - anchor.wallClockMillis
 
-        val drift = abs(deltaWall - deltaElapsed)
+        val deltaElapsed =
+            current.elapsedRealtimeMillis - anchor.elapsedRealtimeMillis
 
-        if (drift > policy.driftToleranceMillis) {
+        val observedDrift =
+            abs(deltaWall - deltaElapsed)
+
+        val daysSinceAnchor =
+            maxOf(
+                0L,
+                (current.wallClockMillis - anchor.wallClockMillis)
+                        / (24 * 60 * 60 * 1000)
+            )
+
+        val allowedDrift =
+            policy.baseDriftToleranceMillis +
+                    daysSinceAnchor * policy.driftPerDayMillis
+
+        if (observedDrift > allowedDrift) {
             return TimeIntegrityResult.Tampered(
-                details = "Anchor-based clock drift exceeded tolerance: ${drift}ms"
+                details =
+                    "Anchor‑based clock drift exceeded tolerance: " +
+                            "${observedDrift}ms (allowed ${allowedDrift}ms)"
             )
         }
 
-        // --------------------------------------------------
-        // ✅ All checks passed
-        // --------------------------------------------------
+        /* ================================================================
+         * ✅ ALL CHECKS PASSED
+         * ================================================================ */
         return TimeIntegrityResult.OK
     }
 
-    // --------------------------------------------------
-    // System configuration checks
-    // --------------------------------------------------
+    /* ================================================================
+     * SYSTEM CONFIGURATION HELPERS
+     * ================================================================ */
 
     private fun isAutoTimeEnabled(): Boolean {
         return Settings.Global.getInt(

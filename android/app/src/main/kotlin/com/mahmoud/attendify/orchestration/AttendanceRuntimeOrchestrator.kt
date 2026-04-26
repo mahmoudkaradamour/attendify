@@ -24,23 +24,33 @@ import com.mahmoud.attendify.matching.MatchDecision
 /**
  * AttendanceRuntimeOrchestrator
  *
- * PURPOSE:
- * --------
- * Executes the full runtime attendance pipeline using a SINGLE input image.
+ * ============================================================================
+ * ROLE (What this class is responsible for):
+ * ============================================================================
+ * Orchestrates the FULL runtime attendance pipeline using a SINGLE camera frame.
  *
- * SECURITY & ARCHITECTURE GUARANTEES:
- * ----------------------------------
- * - No policy definition
- * - No persistence
- * - Fail-fast on first blocking condition
- * - No UI / Flutter knowledge
- * - Deterministic & auditable execution path
+ * This is a **pure coordination layer**:
+ *  - It glues independent subsystems together
+ *  - It owns NO business rules
+ *  - It stores NO data
+ *  - It defines NO policies
  *
- * NOTE:
- * -----
- * This class is intentionally procedural and explicit.
- * Future evolution toward Chain-of-Responsibility is prepared
- * via dedicated interceptor abstractions (outside this file).
+ * ============================================================================
+ * SECURITY & ARCHITECTURAL GUARANTEES:
+ * ============================================================================
+ * ✅ Fail‑Fast: the first blocking condition aborts the pipeline immediately
+ * ✅ Deterministic: same input → same decision
+ * ✅ Auditable: all security‑relevant decisions are explicit
+ * ✅ UI‑agnostic: zero knowledge about Flutter or presentation
+ * ✅ Defensive: resistant to race conditions and user abuse
+ *
+ * ============================================================================
+ * IMPORTANT DESIGN NOTE:
+ * ============================================================================
+ * The logic is intentionally procedural and explicit.
+ *
+ * A future migration to Chain‑of‑Responsibility (Interceptors) is possible,
+ * but NOT prematurely implemented here to avoid abstract complexity.
  */
 class AttendanceRuntimeOrchestrator(
 
@@ -49,7 +59,7 @@ class AttendanceRuntimeOrchestrator(
     private val faceNet: MobileFaceNet,
 
     /* -------------- LIVENESS -------------- */
-    private val livenessOrchestrator: LivenessOrchestrator?, // nullable by policy
+    private val livenessOrchestrator: LivenessOrchestrator?, // Nullable by policy
     private val facialMetricsEngine: FacialMetricsEngine,
 
     /* --------------- MATCHING ------------- */
@@ -60,21 +70,34 @@ class AttendanceRuntimeOrchestrator(
 ) {
 
     /**
-     * Guards against concurrent / repeated execution
-     * (Double-tap, race conditions, slow devices).
+     * Concurrent execution guard.
+     *
+     * WHY THIS EXISTS:
+     * - Prevents spam clicks / auto‑clickers
+     * - Prevents concurrent ML inference
+     * - Prevents OutOfMemory on low‑end devices
+     *
+     * AtomicBoolean is intentionally chosen over Mutex here:
+     * ✅ simpler
+     * ✅ non‑blocking
+     * ✅ fail‑fast
      */
     private val isProcessing = AtomicBoolean(false)
 
     /**
      * attemptAttendance
      *
-     * Entry point for a full attendance attempt using one bitmap.
+     * =========================================================================
+     * ENTRY POINT
+     * =========================================================================
      *
-     * @param action       CHECK_IN or CHECK_OUT
-     * @param frameBitmap Full camera frame (RGB bitmap)
+     * Executes a complete attendance attempt from a single RGB bitmap.
+     *
+     * @param action       AttendanceAction (CHECK_IN / CHECK_OUT)
+     * @param frameBitmap Full camera frame (already RGB)
      * @param employeeId  Target employee identifier
      *
-     * @return AttendanceResult (Accepted or Blocked)
+     * @return AttendanceResult.Accepted or AttendanceResult.Blocked
      */
     fun attemptAttendance(
         action: AttendanceAction,
@@ -82,10 +105,13 @@ class AttendanceRuntimeOrchestrator(
         employeeId: String
     ): AttendanceResult {
 
-        /* ==================================================
-         * 🔒 CONCURRENCY GUARD
-         * ==================================================
-         * Prevents multiple concurrent attendance executions.
+        /* ================================================================
+         * 🔒 CONCURRENCY GUARD (ABSOLUTE FIRST)
+         * ================================================================
+         * If another attendance attempt is running:
+         *  - Drop this request immediately
+         *  - Do NOT queue
+         *  - Do NOT wait
          */
         if (!isProcessing.compareAndSet(false, true)) {
             return AttendanceResult.Blocked(
@@ -95,10 +121,15 @@ class AttendanceRuntimeOrchestrator(
 
         try {
 
-            /* ==================================================
+            /* ================================================================
              * 1️⃣ IMAGE QUALITY GATE
-             * ==================================================
-             * Prevents unusable frames from entering ML pipeline.
+             * ================================================================
+             * Filters out:
+             *  - Extremely dark frames
+             *  - Blurry frames
+             *  - Obvious camera failures
+             *
+             * Prevents garbage from reaching ML pipeline.
              */
             val imageStatus = ImageQualityChecker.checkFrame(frameBitmap)
             if (imageStatus != SystemStatus.OK) {
@@ -107,36 +138,41 @@ class AttendanceRuntimeOrchestrator(
                 )
             }
 
-            /* ==================================================
+            /* ================================================================
              * 2️⃣ FACE DETECTION
-             * ==================================================
-             * Detect ONE best face only.
-             * Security assumption: detector must not accept
-             * ambiguous or unstable detections.
+             * ================================================================
+             * Detect exactly ONE viable face.
+             *
+             * Any ambiguity is treated as failure.
              */
             val detection = faceDetector.detectBestFace(frameBitmap)
                 ?: return AttendanceResult.Blocked(
                     reason = "No face detected"
                 )
 
-            /* ==================================================
-             * 3️⃣ FACE CROP (SECURITY‑AWARE, EXPANDED)
-             * ==================================================
-             * Uses expanded crop to preserve background for FAS.
+            /* ================================================================
+             * 3️⃣ FACE CROP
+             * ================================================================
+             * Security‑aware crop:
+             *  - Expanded margins
+             *  - Preserves background for spoof analysis
              */
             val faceBitmap = FaceCropper.cropAndResize(
                 sourceBitmap = frameBitmap,
                 faceBox = detection.box,
-                targetSize = 112 // MobileFaceNet input
+                targetSize = 112 // MobileFaceNet expected input
             ) ?: return AttendanceResult.Blocked(
                 reason = "Face crop failed"
             )
 
-            /* ==================================================
-             * 4️⃣ LIVENESS (OPTIONAL, POLICY‑DRIVEN)
-             * ==================================================
-             * Executed only if enabled by policy.
-             * Execution state is tracked explicitly for audit.
+            /* ================================================================
+             * 4️⃣ LIVENESS (OPTIONAL, BUT AUDITED)
+             * ================================================================
+             * Liveness may be disabled by policy.
+             *
+             * CRITICAL RULE:
+             * The system MUST remember whether liveness was executed.
+             * This is passed downstream for forensic audit.
              */
             val livenessExecuted = livenessOrchestrator != null
 
@@ -155,23 +191,28 @@ class AttendanceRuntimeOrchestrator(
                 }
             }
 
-            /* ==================================================
+            /* ================================================================
              * 5️⃣ FACE EMBEDDING
-             * ==================================================
-             * Generates normalized embedding vector.
+             * ================================================================
+             * Convert face bitmap into normalized embedding vector.
+             *
+             * Any exception here is treated as hard failure
+             * (corrupt frame, memory pressure, model instability).
              */
             val embedding = try {
                 faceNet.getEmbedding(faceBitmap)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 return AttendanceResult.Blocked(
                     reason = "Face embedding extraction failed"
                 )
             }
 
-            /* ==================================================
+            /* ================================================================
              * 6️⃣ FACE MATCHING
-             * ==================================================
-             * Delegates ALL decision logic to matching layer.
+             * ================================================================
+             * Delegates all matching logic to domain use‑case.
+             *
+             * Orchestrator does NOT interpret distances or thresholds.
              */
             val matchDecision = faceMatchingUseCase.matchNow(
                 liveEmbedding = embedding,
@@ -180,7 +221,7 @@ class AttendanceRuntimeOrchestrator(
 
             when (matchDecision) {
                 is MatchDecision.MatchSuccess -> {
-                    // continue
+                    // Continue pipeline
                 }
                 else -> {
                     return AttendanceResult.Blocked(
@@ -189,13 +230,15 @@ class AttendanceRuntimeOrchestrator(
                 }
             }
 
-            /* ==================================================
+            /* ================================================================
              * 7️⃣ ADMINISTRATIVE ATTENDANCE DECISION
-             * ==================================================
-             * Time / Location / Working Time.
+             * ================================================================
+             * This step:
+             *  - Combines Time Integrity
+             *  - Location Integrity
+             *  - Working Time Policies
              *
-             * NOTE:
-             * livenessExecuted is propagated for forensic audit.
+             * livenessExecuted is passed explicitly for audit trail.
              */
             return attendanceUseCase.attempt(
                 action = action,
@@ -203,9 +246,10 @@ class AttendanceRuntimeOrchestrator(
             )
 
         } finally {
-            /* ==================================================
-             * 🔓 RELEASE CONCURRENCY GUARD
-             * ==================================================
+            /* ================================================================
+             * 🔓 CONCURRENCY GUARD RELEASE
+             * ================================================================
+             * Must ALWAYS execute to avoid permanent lock‑out.
              */
             isProcessing.set(false)
         }
