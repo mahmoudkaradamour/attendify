@@ -1,21 +1,30 @@
 package com.mahmoud.attendify.channel
 
-import android.graphics.Bitmap
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import com.mahmoud.attendify.attendance.AttendanceUseCase
-import com.mahmoud.attendify.attendance.AttendanceDecision
-import com.mahmoud.attendify.attendance.RejectionReason
+import com.mahmoud.attendify.attendance.domain.AttendanceAction
+import com.mahmoud.attendify.attendance.domain.AttendanceResult
+import com.mahmoud.attendify.attendance.orchestration.AttendanceRuntimeOrchestrator
 import com.mahmoud.attendify.attendance.AttendanceSession
+
 /**
  * AttendanceMethodChannel
  *
- * ✅ جسر الاتصال بين Flutter و Native
- * ✅ لا يحتوي أي منطق أعمال
- * ✅ يحول البيانات فقط
+ * ROLE:
+ * -----
+ * ✅ Flutter ⇄ Native bridge
+ * ✅ Data mapping only
+ *
+ * IMPORTANT:
+ * ----------
+ * ❌ No business logic
+ * ❌ No policy inference
+ * ❌ No null‑based guessing
+ *
+ * Domain decisions must be explicit in AttendanceResult.
  */
 class AttendanceMethodChannel(
-    private val attendanceUseCase: AttendanceUseCase
+    private val runtimeOrchestrator: AttendanceRuntimeOrchestrator
 ) : MethodChannel.MethodCallHandler {
 
     override fun onMethodCall(
@@ -24,124 +33,100 @@ class AttendanceMethodChannel(
     ) {
         when (call.method) {
 
-            "startAttendance" -> {
+            "startAttendance" ->
                 handleStartAttendance(call, result)
-            }
 
-            "cancelAttendance" -> {
+            "cancelAttendance" ->
                 result.success(true)
-            }
 
-            else -> {
+            else ->
                 result.notImplemented()
-            }
         }
     }
 
-    /**
-     * startAttendance
-     *
-     * في هذه المرحلة:
-     * - Flutter يمرر employeeId + embedding
-     * - Native يملك الصورة (faceBitmap) من Pipeline
-     *
-     * 📌 ربط السياسات و الصورة سيتم لاحقًا من Flutter
-     */
     private fun handleStartAttendance(
         call: MethodCall,
         result: MethodChannel.Result
     ) {
         try {
             val employeeId = call.argument<String>("employeeId")
-                ?: run {
-                    result.error("INVALID_ARGS", "employeeId missing", null)
-                    return
-                }
-
-            val embedding = call.argument<List<Double>>("embedding")
-                ?: run {
-                    result.error("INVALID_ARGS", "embedding missing", null)
-                    return
-                }
-
-            val floatEmbedding = FloatArray(embedding.size) {
-                embedding[it].toFloat()
-            }
-
-            /**
-             * 🔴 ملاحظة مهمة:
-             * - faceBitmap يأتي من Native Pipeline
-             * - في هذه المرحلة نمرّر Bitmap وهمي
-             *
-             * ➜ هذا مؤقت
-             * ➜ سيتم استبداله عند ربط Flutter بالـ Camera session
-             */
-            val faceBitmap =
-                AttendanceSession.consumeFace()
-                    ?: run {
-                        result.error(
-                            "NO_FACE",
-                            "No valid face captured yet",
-                            null
-                        )
-                        return
-                    }
-
-
-            val decision =
-                attendanceUseCase.attemptAttendance(
-                    faceBitmap = faceBitmap,
-                    liveEmbedding = floatEmbedding,
-                    employeeId = employeeId,
-
-                    employeePolicy = null,
-                    groupPolicy = null,
-                    orgPolicy = null
+                ?: return result.error(
+                    "INVALID_ARGS",
+                    "employeeId missing",
+                    null
                 )
 
+            val actionName = call.argument<String>("action")
+                ?: return result.error(
+                    "INVALID_ARGS",
+                    "action missing",
+                    null
+                )
 
-            result.success(serializeDecision(decision))
+            val action = try {
+                AttendanceAction.valueOf(actionName)
+            } catch (e: Exception) {
+                return result.error(
+                    "INVALID_ARGS",
+                    "Invalid action: $actionName",
+                    null
+                )
+            }
+
+            val faceBitmap =
+                AttendanceSession.consumeFace()
+                    ?: return result.error(
+                        "NO_FACE",
+                        "No valid face captured yet",
+                        null
+                    )
+
+            val attendanceResult =
+                runtimeOrchestrator.attemptAttendance(
+                    action = action,
+                    frameBitmap = faceBitmap,
+                    employeeId = employeeId
+                )
+
+            result.success(serializeResult(attendanceResult))
 
         } catch (e: Exception) {
             result.error(
                 "NATIVE_ERROR",
-                e.message ?: "Unknown error",
+                e.message ?: "Unknown native error",
                 null
             )
         }
     }
 
     /**
-     * تحويل AttendanceDecision إلى Map بسيط لFlutter
+     * Serialize AttendanceResult for Flutter.
+     *
+     * NOTE:
+     * -----
+     * Justification policy is NOT inferred here.
+     * Flutter receives only explicit domain output.
      */
-    private fun serializeDecision(
-        decision: AttendanceDecision
-    ): Map<String, Any> {
+    private fun serializeResult(
+        result: AttendanceResult
+    ): Map<String, Any> =
+        when (result) {
 
-        return when (decision) {
+            is AttendanceResult.Accepted ->
+                buildMap {
+                    put("status", "ACCEPTED")
+                    put("action", result.action.name)
 
-            AttendanceDecision.AttendanceRecorded ->
-                mapOf(
-                    "status" to "RECORDED"
-                )
-
-            is AttendanceDecision.AttendanceRejected -> {
-                when (val reason = decision.reason) {
-
-                    is RejectionReason.FASRejected ->
-                        mapOf(
-                            "status" to "REJECTED",
-                            "reason" to "FAS",
-                            "message" to reason.reason
-                        )
-
-                    is RejectionReason.FaceMismatch ->
-                        mapOf(
-                            "status" to "REJECTED",
-                            "reason" to "NO_MATCH"
-                        )
+                    // Included only if domain provided it explicitly
+                    result.justification?.let {
+                        put("justification", it)
+                    }
                 }
-            }
+
+            is AttendanceResult.Blocked ->
+                mapOf(
+                    "status" to "BLOCKED",
+                    "reason" to result.reason
+                )
         }
-    }
 }
