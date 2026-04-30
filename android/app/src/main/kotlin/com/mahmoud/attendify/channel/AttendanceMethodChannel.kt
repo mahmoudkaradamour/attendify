@@ -2,30 +2,52 @@ package com.mahmoud.attendify.channel
 
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+
 import com.mahmoud.attendify.attendance.domain.AttendanceAction
 import com.mahmoud.attendify.attendance.domain.AttendanceResult
-import com.mahmoud.attendify.attendance.orchestration.AttendanceRuntimeOrchestrator
-import com.mahmoud.attendify.attendance.AttendanceSession
+import com.mahmoud.attendify.orchestration.AttendanceRuntimeOrchestrator
 
 /**
  * AttendanceMethodChannel
  *
+ * ============================================================================
  * ROLE:
- * -----
- * ✅ Flutter ⇄ Native bridge
+ * ============================================================================
+ * ✅ Flutter ⇄ Native asynchronous bridge
  * ✅ Data mapping only
  *
- * IMPORTANT:
- * ----------
+ * IMPORTANT NON‑NEGOTIABLE RULES:
+ * ============================================================================
  * ❌ No business logic
+ * ❌ No ML calls
  * ❌ No policy inference
- * ❌ No null‑based guessing
+ * ❌ No camera or bitmap handling
  *
- * Domain decisions must be explicit in AttendanceResult.
+ * This layer:
+ *  - Translates Flutter arguments → domain inputs
+ *  - Invokes suspend orchestration safely
+ *  - Serializes explicit AttendanceResult back to Flutter
+ *
+ * All decisions MUST already be encoded in AttendanceResult.
  */
 class AttendanceMethodChannel(
     private val runtimeOrchestrator: AttendanceRuntimeOrchestrator
 ) : MethodChannel.MethodCallHandler {
+
+    /**
+     * Coroutine scope bound to Main thread.
+     *
+     * WHY Main?
+     * ----------
+     * - MethodChannel callbacks must return on main thread
+     * - Heavy work is safely suspended inside orchestrator/usecases
+     */
+    private val scope =
+        CoroutineScope(Dispatchers.Main)
 
     override fun onMethodCall(
         call: MethodCall,
@@ -44,68 +66,92 @@ class AttendanceMethodChannel(
         }
     }
 
+    /**
+     * handleStartAttendance
+     *
+     * =========================================================================
+     * Validates Flutter input, then launches attendance asynchronously.
+     */
     private fun handleStartAttendance(
         call: MethodCall,
         result: MethodChannel.Result
     ) {
-        try {
-            val employeeId = call.argument<String>("employeeId")
-                ?: return result.error(
-                    "INVALID_ARGS",
-                    "employeeId missing",
-                    null
-                )
 
-            val actionName = call.argument<String>("action")
-                ?: return result.error(
-                    "INVALID_ARGS",
-                    "action missing",
-                    null
-                )
+        val employeeId =
+            call.argument<String>("employeeId")
+                ?: run {
+                    result.error(
+                        "INVALID_ARGS",
+                        "employeeId missing",
+                        null
+                    )
+                    return
+                }
 
-            val action = try {
+        val actionName =
+            call.argument<String>("action")
+                ?: run {
+                    result.error(
+                        "INVALID_ARGS",
+                        "action missing",
+                        null
+                    )
+                    return
+                }
+
+        val action =
+            try {
                 AttendanceAction.valueOf(actionName)
-            } catch (e: Exception) {
-                return result.error(
+            } catch (_: Exception) {
+                result.error(
                     "INVALID_ARGS",
                     "Invalid action: $actionName",
                     null
                 )
+                return
             }
 
-            val faceBitmap =
-                AttendanceSession.consumeFace()
-                    ?: return result.error(
-                        "NO_FACE",
-                        "No valid face captured yet",
-                        null
+        /**
+         * ✅ COROUTINE BOUNDARY (Stage 0.3)
+         *
+         * - Orchestrator is suspend
+         * - Never block MethodChannel thread
+         */
+        scope.launch {
+
+            try {
+
+                val attendanceResult =
+                    runtimeOrchestrator.attemptAttendance(
+                        action = action,
+                        employeeId = employeeId
                     )
 
-            val attendanceResult =
-                runtimeOrchestrator.attemptAttendance(
-                    action = action,
-                    frameBitmap = faceBitmap,
-                    employeeId = employeeId
+                result.success(
+                    serializeResult(attendanceResult)
                 )
 
-            result.success(serializeResult(attendanceResult))
+            } catch (t: Throwable) {
 
-        } catch (e: Exception) {
-            result.error(
-                "NATIVE_ERROR",
-                e.message ?: "Unknown native error",
-                null
-            )
+                result.error(
+                    "NATIVE_ERROR",
+                    t.message ?: "Unknown native error",
+                    null
+                )
+            }
         }
     }
 
     /**
-     * Serialize AttendanceResult for Flutter.
+     * serializeResult
      *
-     * NOTE:
-     * -----
-     * Justification policy is NOT inferred here.
-     * Flutter receives only explicit domain output.
+     * =========================================================================
+     * Converts AttendanceResult → simple Map for Flutter.
+     *
+     * Justification:
+     * --------------
+     * - Policy interpretation is NOT done here
+     * - Flutter receives explicit domain output only
      */
     private fun serializeResult(
         result: AttendanceResult
@@ -117,9 +163,9 @@ class AttendanceMethodChannel(
                     put("status", "ACCEPTED")
                     put("action", result.action.name)
 
-                    // Included only if domain provided it explicitly
+                    // Included ONLY if domain explicitly attached it
                     result.justification?.let {
-                        put("justification", it)
+                        put("justification", it.text)
                     }
                 }
 

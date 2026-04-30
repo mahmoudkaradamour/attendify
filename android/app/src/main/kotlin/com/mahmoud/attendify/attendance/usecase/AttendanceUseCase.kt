@@ -1,18 +1,26 @@
 package com.mahmoud.attendify.attendance.usecase
 
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
+
 import com.mahmoud.attendify.attendance.domain.AttendanceAction
 import com.mahmoud.attendify.attendance.domain.AttendanceResult
+
 import com.mahmoud.attendify.system.location.LocationIntegrityGuard
 import com.mahmoud.attendify.system.location.LocationIntegrityResult
 import com.mahmoud.attendify.system.location.zones.LocationZonesPolicy
 import com.mahmoud.attendify.system.location.zones.ZoneEvaluator
 import com.mahmoud.attendify.system.location.zones.ZonePolicy
+
 import com.mahmoud.attendify.system.time.AttendanceTimeProofFactory
 import com.mahmoud.attendify.system.time.TimeAnchorStorage
 import com.mahmoud.attendify.system.time.TimeIntegrityGuard
 import com.mahmoud.attendify.system.time.TimeIntegrityResult
 import com.mahmoud.attendify.system.time.TimeSource
 import com.mahmoud.attendify.system.time.toInstant
+
 import com.mahmoud.attendify.system.time.working.OutOfWorkingTimeAction
 import com.mahmoud.attendify.system.time.working.WorkingTimeEvaluator
 import com.mahmoud.attendify.system.time.working.WorkingTimeEvidence
@@ -21,35 +29,38 @@ import com.mahmoud.attendify.system.time.working.WorkingTimeEvidence
  * AttendanceUseCase
  *
  * ============================================================================
- * ROLE (FINAL AUTHORITY):
+ * ROLE (FINAL AUTHORITY — NON‑NEGOTIABLE):
  * ============================================================================
- * The SINGLE decision-making authority for attendance acceptance.
+ * This class is the SINGLE and FINAL authority that decides whether
+ * an attendance operation is ACCEPTED or BLOCKED.
+ *
+ * It is invoked ONLY AFTER biometric identity is already verified.
  *
  * This class:
- *  ✅ Combines all validated evidence
- *  ✅ Applies administrative policies
- *  ✅ Produces a legally defensible AttendanceResult
+ *  ✅ Aggregates trusted evidence
+ *  ✅ Applies administrative / legal policies
+ *  ✅ Produces an audit‑grade, defensible AttendanceResult
  *
  * This class NEVER:
- *  ❌ Talks to UI / Flutter
- *  ❌ Talks to sensors or Android framework directly
- *  ❌ Performs biometric verification
+ *  ❌ Talks to UI or Flutter
+ *  ❌ Talks to cameras or sensors
+ *  ❌ Performs biometric checks
  *
  * ============================================================================
- * DECISION FLOW (LOCKED DESIGN):
+ * SECURITY HARDENING (STAGE 0.2):
  * ============================================================================
- * 1) Time Integrity        (security / anchor-based)
- * 2) Working Time Policy  (administrative / HR)
- * 3) Location Integrity   (technical / anti-spoof)
- * 4) Zone Policy          (administrative / contextual)
- * 5) Evidence aggregation
+ * ✅ Strict single‑flight execution (Mutex)
+ * ✅ Time‑bounded execution (withTimeout)
+ * ✅ Automatic self‑recovery (no permanent lockout)
  *
- * ANY failure aborts immediately (Fail-Secure).
+ * Result:
+ * ------
+ * No retry storms, no deadlocks, no silent OOM, no parallel decisions.
  */
 class AttendanceUseCase(
 
     /* ----------------------------------------------------------------
-     * TIME (SECURITY CRITICAL)
+     * TIME (SECURITY CRITICAL — ANCHOR BASED)
      * ---------------------------------------------------------------- */
     private val timeIntegrityGuard: TimeIntegrityGuard,
     private val timeProofFactory: AttendanceTimeProofFactory,
@@ -61,196 +72,239 @@ class AttendanceUseCase(
     private val locationIntegrityGuard: LocationIntegrityGuard,
 
     /* ----------------------------------------------------------------
-     * LOCATION ZONES (ADMINISTRATIVE POLICY)
+     * LOCATION ZONES (ADMINISTRATIVE CONTEXT)
      * ---------------------------------------------------------------- */
     private val zonesPolicy: LocationZonesPolicy,
 
     /* ----------------------------------------------------------------
-     * WORKING TIME (OPTIONAL ADMINISTRATIVE LAYER)
+     * WORKING TIME (OPTIONAL HR LAYER)
      * ---------------------------------------------------------------- */
     private val workingTimeEvaluator: WorkingTimeEvaluator?
 ) {
 
     /**
+     * attendanceMutex
+     *
+     * ------------------------------------------------------------------------
+     * Guarantees STRICT single‑flight execution.
+     *
+     * WHY Mutex?
+     * ----------
+     * - Coroutine‑aware locking
+     * - Cooperates with structured concurrency
+     * - Automatically released on cancellation
+     *
+     * SECURITY RULE:
+     * --------------
+     * At most ONE attendance decision may execute at any moment.
+     */
+    private val attendanceMutex = Mutex()
+
+    /**
      * attempt
      *
-     * Executes the FULL administrative attendance decision
-     * AFTER biometric verification has succeeded.
+     * =========================================================================
+     * Executes the FULL administrative attendance decision.
      *
-     * IMPORTANT:
-     * ----------
-     * This function assumes identity is already verified.
-     * It focuses ONLY on contextual legitimacy.
+     * HARD GUARANTEES:
+     * ----------------
+     * ✅ No concurrent execution
+     * ✅ No retry amplification
+     * ✅ Guaranteed termination (timeout)
      *
      * @param action            CHECK_IN or CHECK_OUT
-     * @param livenessExecuted  Whether liveness was executed (for audit)
+     * @param livenessExecuted  Explicit forensic flag
      */
-    fun attempt(
+    suspend fun attempt(
         action: AttendanceAction,
         livenessExecuted: Boolean
     ): AttendanceResult {
 
-        /* ================================================================
-         * 1️⃣ TIME INTEGRITY (ABSOLUTE SECURITY GATE)
-         * ================================================================
-         * No trustworthy time → nothing else matters.
-         */
-        val timeResult = timeIntegrityGuard.validate()
+        return try {
 
-        if (
-            timeResult is TimeIntegrityResult.Blocked ||
-            timeResult is TimeIntegrityResult.Tampered
-        ) {
-            return AttendanceResult.Blocked(
-                reason = "Time integrity validation failed",
-                timeReason = timeResult
-            )
-        }
+            /* ================================================================
+             * ⛔ TIME‑BOUNDED SINGLE‑FLIGHT EXECUTION
+             * ================================================================
+             * If execution exceeds 10 seconds:
+             *  - Cancellation occurs
+             *  - Mutex is automatically released
+             *  - System recovers safely
+             */
+            withTimeout(10_000L) {
 
-        /* ================================================================
-         * 2️⃣ TRUSTED TIME SNAPSHOT
-         * ================================================================
-         * This is now safe because integrity passed.
-         */
-        val timeSnapshot = TimeSource.snapshot()
+                attendanceMutex.withLock {
 
-        /* ================================================================
-         * 3️⃣ WORKING TIME POLICY (HR RULES)
-         * ================================================================
-         * Determines whether attendance is allowed
-         * based on shifts, holidays, etc.
-         */
-        val workingTimeDecision =
-            workingTimeEvaluator?.evaluate(timeSnapshot.toInstant())
+                    /* ========================================================
+                     * 1️⃣ TIME INTEGRITY (ABSOLUTE SECURITY GATE)
+                     * ======================================================== */
+                    val timeResult =
+                        timeIntegrityGuard.validate()
 
-        if (
-            workingTimeDecision != null &&
-            workingTimeDecision.action == OutOfWorkingTimeAction.BLOCK
-        ) {
-            return AttendanceResult.Blocked(
-                reason = "Attendance blocked by working time policy"
-            )
-        }
+                    if (
+                        timeResult is TimeIntegrityResult.Blocked ||
+                        timeResult is TimeIntegrityResult.Tampered
+                    ) {
+                        return@withLock AttendanceResult.Blocked(
+                            reason = "Time integrity validation failed",
+                            timeReason = timeResult
+                        )
+                    }
 
-        /* ================================================================
-         * 4️⃣ CREATE TIME PROOF (FORENSIC EVIDENCE)
-         * ================================================================
-         */
-        val timeProof = timeProofFactory.create(
-            currentSnapshot = timeSnapshot,
-            integrityResult = timeResult
-        )
+                    /* ========================================================
+                     * 2️⃣ TRUSTED TIME SNAPSHOT
+                     * ======================================================== */
+                    val timeSnapshot =
+                        TimeSource.snapshot()
 
-        /**
-         * The anchor is updated ONLY AFTER a successful integrity pass.
-         * This prevents attacker-controlled anchors.
-         */
-        timeAnchorStorage.saveAnchor(timeSnapshot)
+                    /* ========================================================
+                     * 3️⃣ WORKING TIME POLICY (HR RULES)
+                     * ======================================================== */
+                    val workingTimeDecision =
+                        workingTimeEvaluator
+                            ?.evaluate(timeSnapshot.toInstant())
 
-        /* ================================================================
-         * 5️⃣ LOCATION INTEGRITY (ANTI-SPOOF)
-         * ================================================================
-         * Verifies:
-         * - freshness
-         * - no mock
-         * - no teleportation
-         */
-        val locationResult = locationIntegrityGuard.evaluate()
+                    if (
+                        workingTimeDecision != null &&
+                        workingTimeDecision.action ==
+                        OutOfWorkingTimeAction.BLOCK
+                    ) {
+                        return@withLock AttendanceResult.Blocked(
+                            reason =
+                                "Attendance blocked by working time policy"
+                        )
+                    }
 
-        if (locationResult is LocationIntegrityResult.Blocked) {
-            return AttendanceResult.Blocked(
-                reason =
-                    "Location integrity validation failed: ${locationResult.reason}"
-            )
-        }
+                    /* ========================================================
+                     * 4️⃣ TIME PROOF (FORENSIC EVIDENCE)
+                     * ======================================================== */
+                    val timeProof =
+                        timeProofFactory.create(
+                            currentSnapshot = timeSnapshot,
+                            integrityResult = timeResult
+                        )
 
-        val locationEvidence =
-            (locationResult as LocationIntegrityResult.Allowed).evidence
+                    /**
+                     * Anchor update occurs ONLY after
+                     * successful integrity validation.
+                     *
+                     * This prevents attacker‑controlled anchors.
+                     */
+                    timeAnchorStorage.saveAnchor(
+                        timeSnapshot
+                    )
 
-        /* ================================================================
-         * 6️⃣ ZONE POLICY (ADMINISTRATIVE CONTEXT)
-         * ================================================================
-         * Interprets the trusted location in an HR context.
-         */
+                    /* ========================================================
+                     * 5️⃣ LOCATION INTEGRITY (ANTI‑SPOOF)
+                     * ======================================================== */
+                    val locationResult =
+                        locationIntegrityGuard.evaluate()
 
-        /* ================================================================
- * 6️⃣ ZONE POLICY (ADMINISTRATIVE CONTEXT)
- * ================================================================
- * At this point, location integrity has already passed.
- * Therefore, required coordinates MUST be present.
- *
- * If they are missing, this is a system inconsistency,
- * not a user error.
- */
-        val latitude = locationEvidence.latitude
-            ?: return AttendanceResult.Blocked(
-                reason = "Location evidence missing latitude after integrity approval"
-            )
+                    if (locationResult
+                                is LocationIntegrityResult.Blocked
+                    ) {
+                        return@withLock AttendanceResult.Blocked(
+                            reason =
+                                "Location integrity failed: " +
+                                        locationResult.reason
+                        )
+                    }
 
-        val longitude = locationEvidence.longitude
-            ?: return AttendanceResult.Blocked(
-                reason = "Location evidence missing longitude after integrity approval"
-            )
+                    val locationEvidence =
+                        (locationResult
+                                as LocationIntegrityResult.Allowed)
+                            .evidence
 
-        val accuracyMeters = locationEvidence.accuracyMeters
-            ?.toDouble()
-            ?: return AttendanceResult.Blocked(
-                reason = "Location evidence missing accuracy after integrity approval"
-            )
+                    /* ========================================================
+                     * 6️⃣ ZONE POLICY (ADMINISTRATIVE CONTEXT)
+                     * ======================================================== */
+                    val latitude =
+                        locationEvidence.latitude
+                            ?: return@withLock AttendanceResult.Blocked(
+                                reason =
+                                    "Missing latitude after location approval"
+                            )
 
-        val zoneDecision =
-            ZoneEvaluator.evaluate(
-                latitude = latitude,
-                longitude = longitude,
-                accuracyMeters = accuracyMeters,
-                zonesPolicy = zonesPolicy
-            )
+                    val longitude =
+                        locationEvidence.longitude
+                            ?: return@withLock AttendanceResult.Blocked(
+                                reason =
+                                    "Missing longitude after location approval"
+                            )
 
+                    val accuracyMeters =
+                        locationEvidence.accuracyMeters
+                            ?.toDouble()
+                            ?: return@withLock AttendanceResult.Blocked(
+                                reason =
+                                    "Missing GPS accuracy after location approval"
+                            )
 
-        when (zoneDecision.policy) {
-            ZonePolicy.BLOCK -> {
-                return AttendanceResult.Blocked(
-                    reason = "Attendance blocked by location zone policy"
-                )
+                    val zoneDecision =
+                        ZoneEvaluator.evaluate(
+                            latitude = latitude,
+                            longitude = longitude,
+                            accuracyMeters = accuracyMeters,
+                            zonesPolicy = zonesPolicy
+                        )
+
+                    if (zoneDecision.policy == ZonePolicy.BLOCK) {
+                        return@withLock AttendanceResult.Blocked(
+                            reason =
+                                "Attendance blocked by zone policy"
+                        )
+                    }
+
+                    /* ========================================================
+                     * 7️⃣ JUSTIFICATION & EVIDENCE AGGREGATION
+                     * ======================================================== */
+                    val justificationRequired =
+                        locationEvidence.justificationRequired ||
+                                zoneDecision.policy ==
+                                ZonePolicy.ALLOW_WITH_JUSTIFICATION ||
+                                workingTimeDecision?.action ==
+                                OutOfWorkingTimeAction.ALLOW_WITH_JUSTIFICATION
+
+                    val workingTimeEvidence =
+                        workingTimeDecision?.let {
+                            WorkingTimeEvidence(
+                                policyId = it.policy.id,
+                                policyName = it.policy.name,
+                                isWithinWorkingTime =
+                                    it.isWithinWorkingTime,
+                                isHoliday = it.isHoliday,
+                                action = it.action
+                            )
+                        }
+
+                    /* ========================================================
+                     * ✅ ACCEPTED (FINAL, AUDIT‑SAFE RESULT)
+                     * ======================================================== */
+                    AttendanceResult.Accepted(
+                        action = action,
+                        timeProof = timeProof,
+                        locationEvidence = locationEvidence,
+                        workingTimeEvidence = workingTimeEvidence,
+                        livenessExecuted = livenessExecuted,
+                        justification =
+                            if (justificationRequired) null else null
+                    )
+                }
             }
 
-            else -> {
-                // ALLOW or ALLOW_WITH_JUSTIFICATION handled later
-            }
+        } catch (_: TimeoutCancellationException) {
+
+            /**
+             * ⏱️ TIMEOUT RECOVERY
+             *
+             * GUARANTEE:
+             * ----------
+             * - Mutex released
+             * - System usable
+             * - User can retry safely
+             */
+            AttendanceResult.Blocked(
+                reason = "Attendance processing timeout"
+            )
         }
-
-        /* ================================================================
-         * 7️⃣ JUSTIFICATION & EVIDENCE AGGREGATION
-         * ================================================================
-         */
-        val justificationRequired =
-            locationEvidence.justificationRequired ||
-                    zoneDecision.policy == ZonePolicy.ALLOW_WITH_JUSTIFICATION ||
-                    (workingTimeDecision?.action ==
-                            OutOfWorkingTimeAction.ALLOW_WITH_JUSTIFICATION)
-
-        val workingTimeEvidence =
-            workingTimeDecision?.let {
-                WorkingTimeEvidence(
-                    policyId = it.policy.id,
-                    policyName = it.policy.name,
-                    isWithinWorkingTime = it.isWithinWorkingTime,
-                    isHoliday = it.isHoliday,
-                    action = it.action
-                )
-            }
-
-        /* ================================================================
-         * ✅ ACCEPTED (FINAL, AUDIT-SAFE RESULT)
-         * ================================================================
-         */
-        return AttendanceResult.Accepted(
-            action = action,
-            timeProof = timeProof,
-            locationEvidence = locationEvidence,
-            workingTimeEvidence = workingTimeEvidence,
-            livenessExecuted = livenessExecuted,
-            justification = if (justificationRequired) null else null
-        )
     }
 }

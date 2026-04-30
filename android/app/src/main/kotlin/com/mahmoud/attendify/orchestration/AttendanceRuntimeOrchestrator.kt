@@ -1,12 +1,12 @@
-package com.mahmoud.attendify.attendance.orchestration
+package com.mahmoud.attendify.orchestration
 
-import android.graphics.Bitmap
 import java.util.concurrent.atomic.AtomicBoolean
 
 import com.mahmoud.attendify.attendance.domain.AttendanceAction
 import com.mahmoud.attendify.attendance.domain.AttendanceResult
 import com.mahmoud.attendify.attendance.usecase.AttendanceUseCase
 
+import com.mahmoud.attendify.camera.CameraManager
 import com.mahmoud.attendify.camera.ImageQualityChecker
 import com.mahmoud.attendify.camera.SystemStatus
 
@@ -25,34 +25,44 @@ import com.mahmoud.attendify.matching.MatchDecision
  * AttendanceRuntimeOrchestrator
  *
  * ============================================================================
- * ROLE (What this class is responsible for):
+ * ROLE (FINAL & SEALED):
  * ============================================================================
- * Orchestrates the FULL runtime attendance pipeline using a SINGLE camera frame.
+ * Coordinates the COMPLETE attendance pipeline using
+ * EXACTLY ONE camera frame obtained via CameraManager.
  *
- * This is a **pure coordination layer**:
- *  - It glues independent subsystems together
- *  - It owns NO business rules
- *  - It stores NO data
- *  - It defines NO policies
+ * This class is PURE ORCHESTRATION:
+ *  ✅ No Camera HAL access
+ *  ✅ No frame streaming
+ *  ✅ No business rules
+ *  ✅ No policy decisions
  *
- * ============================================================================
- * SECURITY & ARCHITECTURAL GUARANTEES:
- * ============================================================================
- * ✅ Fail‑Fast: the first blocking condition aborts the pipeline immediately
- * ✅ Deterministic: same input → same decision
- * ✅ Auditable: all security‑relevant decisions are explicit
- * ✅ UI‑agnostic: zero knowledge about Flutter or presentation
- * ✅ Defensive: resistant to race conditions and user abuse
+ * All DECISIONS are delegated to:
+ *  - LivenessOrchestrator
+ *  - FaceMatchingUseCase
+ *  - AttendanceUseCase (FINAL AUTHORITY)
  *
  * ============================================================================
- * IMPORTANT DESIGN NOTE:
+ * SECURITY GUARANTEES:
  * ============================================================================
- * The logic is intentionally procedural and explicit.
+ * Stage 0.1:
+ *  ✅ Frame Freeze (single immutable bitmap)
+ *  ✅ Camera HAL Circuit Breaker respected
  *
- * A future migration to Chain‑of‑Responsibility (Interceptors) is possible,
- * but NOT prematurely implemented here to avoid abstract complexity.
+ * Stage 0.2:
+ *  ✅ No retry storms (guarded upstream)
+ *  ✅ Deterministic sequencing
+ *
+ * Stage 0.3:
+ *  ✅ Proper suspend boundary
+ *  ✅ No blocking calls
+ *  ✅ Safe coroutine interoperability
+ *
+ * Any change here MUST be security-reviewed.
  */
 class AttendanceRuntimeOrchestrator(
+
+    /* ---------------- CAMERA ---------------- */
+    private val cameraManager: CameraManager,
 
     /* ---------------- FACE ---------------- */
     private val faceDetector: FaceDetector,
@@ -70,17 +80,19 @@ class AttendanceRuntimeOrchestrator(
 ) {
 
     /**
-     * Concurrent execution guard.
+     * Concurrency guard (fail-fast).
      *
-     * WHY THIS EXISTS:
-     * - Prevents spam clicks / auto‑clickers
-     * - Prevents concurrent ML inference
-     * - Prevents OutOfMemory on low‑end devices
+     * WHY AtomicBoolean HERE?
+     * -----------------------
+     * - Protects Camera + ML from parallel execution
+     * - Prevents rapid user button spam
+     * - Reduces thermal / memory pressure
      *
-     * AtomicBoolean is intentionally chosen over Mutex here:
-     * ✅ simpler
-     * ✅ non‑blocking
-     * ✅ fail‑fast
+     * IMPORTANT:
+     * ----------
+     * This is an OUTER guard.
+     * A SECOND, STRONGER Mutex exists INSIDE AttendanceUseCase (Stage 0.2).
+     * The two layers serve different purposes and do NOT conflict.
      */
     private val isProcessing = AtomicBoolean(false)
 
@@ -88,50 +100,69 @@ class AttendanceRuntimeOrchestrator(
      * attemptAttendance
      *
      * =========================================================================
-     * ENTRY POINT
+     * SINGLE ENTRY POINT
      * =========================================================================
      *
-     * Executes a complete attendance attempt from a single RGB bitmap.
+     * Executes a FULL attendance attempt.
      *
-     * @param action       AttendanceAction (CHECK_IN / CHECK_OUT)
-     * @param frameBitmap Full camera frame (already RGB)
-     * @param employeeId  Target employee identifier
+     * ❗ This function MUST be suspended (Stage 0.3):
+     * ---------------------------------------------
+     * - Calls suspend AttendanceUseCase
+     * - Performs heavy ML work
+     * - Must not block threads
      *
-     * @return AttendanceResult.Accepted or AttendanceResult.Blocked
+     * IMPORTANT SECURITY RULES:
+     * -------------------------
+     * - Camera frame is obtained HERE and ONLY HERE
+     * - No external Bitmap injection is allowed
+     * - This completely closes the Frame Slippage exploit
+     *
+     * @param action     CHECK_IN / CHECK_OUT
+     * @param employeeId Target employee identifier
      */
-    fun attemptAttendance(
+    suspend fun attemptAttendance(
         action: AttendanceAction,
-        frameBitmap: Bitmap,
         employeeId: String
     ): AttendanceResult {
 
         /* ================================================================
          * 🔒 CONCURRENCY GUARD (ABSOLUTE FIRST)
-         * ================================================================
-         * If another attendance attempt is running:
-         *  - Drop this request immediately
-         *  - Do NOT queue
-         *  - Do NOT wait
-         */
+         * ================================================================ */
         if (!isProcessing.compareAndSet(false, true)) {
             return AttendanceResult.Blocked(
                 reason = "Attendance already in progress"
             )
         }
 
+        /* ================================================================
+         * 🧊 FRAME FREEZE + HARDWARE CIRCUIT BREAKER
+         * ================================================================
+         * - Exactly ONE frame
+         * - Time-bounded
+         * - No camera streaming
+         */
+        val frameBitmap =
+            cameraManager.captureSingleFrame(timeoutMs = 2000)
+                ?: run {
+                    isProcessing.set(false)
+                    return AttendanceResult.Blocked(
+                        reason = "Camera hardware not responding"
+                    )
+                }
+
         try {
 
             /* ================================================================
              * 1️⃣ IMAGE QUALITY GATE
              * ================================================================
-             * Filters out:
-             *  - Extremely dark frames
-             *  - Blurry frames
-             *  - Obvious camera failures
-             *
-             * Prevents garbage from reaching ML pipeline.
+             * Reject unusable frames EARLY:
+             * - Very dark / bright
+             * - Too blurry
+             * - Corrupted frame
              */
-            val imageStatus = ImageQualityChecker.checkFrame(frameBitmap)
+            val imageStatus =
+                ImageQualityChecker.checkFrame(frameBitmap)
+
             if (imageStatus != SystemStatus.OK) {
                 return AttendanceResult.Blocked(
                     reason = "Image quality check failed: $imageStatus"
@@ -139,51 +170,43 @@ class AttendanceRuntimeOrchestrator(
             }
 
             /* ================================================================
-             * 2️⃣ FACE DETECTION
-             * ================================================================
-             * Detect exactly ONE viable face.
-             *
-             * Any ambiguity is treated as failure.
-             */
-            val detection = faceDetector.detectBestFace(frameBitmap)
-                ?: return AttendanceResult.Blocked(
-                    reason = "No face detected"
+             * 2️⃣ FACE DETECTION (SINGLE FACE POLICY)
+             * ================================================================ */
+            val detection =
+                faceDetector.detectBestFace(frameBitmap)
+                    ?: return AttendanceResult.Blocked(
+                        reason = "No face detected"
+                    )
+
+            /* ================================================================
+             * 3️⃣ FACE CROP (SECURITY-AWARE)
+             * ================================================================ */
+            val faceBitmap =
+                FaceCropper.cropAndResize(
+                    sourceBitmap = frameBitmap,
+                    faceBox = detection.box,
+                    targetSize = 112 // MobileFaceNet input size
+                ) ?: return AttendanceResult.Blocked(
+                    reason = "Face crop failed"
                 )
 
             /* ================================================================
-             * 3️⃣ FACE CROP
-             * ================================================================
-             * Security‑aware crop:
-             *  - Expanded margins
-             *  - Preserves background for spoof analysis
-             */
-            val faceBitmap = FaceCropper.cropAndResize(
-                sourceBitmap = frameBitmap,
-                faceBox = detection.box,
-                targetSize = 112 // MobileFaceNet expected input
-            ) ?: return AttendanceResult.Blocked(
-                reason = "Face crop failed"
-            )
-
-            /* ================================================================
              * 4️⃣ LIVENESS (OPTIONAL, BUT AUDITED)
-             * ================================================================
-             * Liveness may be disabled by policy.
-             *
-             * CRITICAL RULE:
-             * The system MUST remember whether liveness was executed.
-             * This is passed downstream for forensic audit.
-             */
-            val livenessExecuted = livenessOrchestrator != null
+             * ================================================================ */
+            val livenessExecuted =
+                livenessOrchestrator != null
 
             if (livenessOrchestrator != null) {
 
                 val metricsFrame =
-                    facialMetricsEngine.computeFrameFromBitmap(faceBitmap)
+                    facialMetricsEngine
+                        .computeFrameFromBitmap(faceBitmap)
 
                 livenessOrchestrator.onFrame(metricsFrame)
 
-                val livenessResult = livenessOrchestrator.evaluate()
+                val livenessResult =
+                    livenessOrchestrator.evaluate()
+
                 if (livenessResult is LivenessResult.SpoofDetected) {
                     return AttendanceResult.Blocked(
                         reason = "Liveness check failed"
@@ -192,13 +215,8 @@ class AttendanceRuntimeOrchestrator(
             }
 
             /* ================================================================
-             * 5️⃣ FACE EMBEDDING
-             * ================================================================
-             * Convert face bitmap into normalized embedding vector.
-             *
-             * Any exception here is treated as hard failure
-             * (corrupt frame, memory pressure, model instability).
-             */
+             * 5️⃣ FACE EMBEDDING (DETERMINISTIC)
+             * ================================================================ */
             val embedding = try {
                 faceNet.getEmbedding(faceBitmap)
             } catch (_: Exception) {
@@ -208,37 +226,25 @@ class AttendanceRuntimeOrchestrator(
             }
 
             /* ================================================================
-             * 6️⃣ FACE MATCHING
-             * ================================================================
-             * Delegates all matching logic to domain use‑case.
-             *
-             * Orchestrator does NOT interpret distances or thresholds.
-             */
-            val matchDecision = faceMatchingUseCase.matchNow(
-                liveEmbedding = embedding,
-                employeeId = employeeId
-            )
+             * 6️⃣ FACE MATCHING (POLICY-DRIVEN)
+             * ================================================================ */
+            val matchDecision =
+                faceMatchingUseCase.matchNow(
+                    liveEmbedding = embedding,
+                    employeeId = employeeId
+                )
 
-            when (matchDecision) {
-                is MatchDecision.MatchSuccess -> {
-                    // Continue pipeline
-                }
-                else -> {
-                    return AttendanceResult.Blocked(
-                        reason = "Face matching failed"
-                    )
-                }
+            if (matchDecision !is MatchDecision.MatchSuccess) {
+                return AttendanceResult.Blocked(
+                    reason = "Face matching failed"
+                )
             }
 
             /* ================================================================
-             * 7️⃣ ADMINISTRATIVE ATTENDANCE DECISION
+             * 7️⃣ FINAL ADMINISTRATIVE ATTENDANCE DECISION
              * ================================================================
-             * This step:
-             *  - Combines Time Integrity
-             *  - Location Integrity
-             *  - Working Time Policies
-             *
-             * livenessExecuted is passed explicitly for audit trail.
+             * Delegates to AttendanceUseCase
+             * (Stage 0.2 — Mutex + Timeout enforced there)
              */
             return attendanceUseCase.attempt(
                 action = action,
@@ -246,11 +252,20 @@ class AttendanceRuntimeOrchestrator(
             )
 
         } finally {
+
             /* ================================================================
-             * 🔓 CONCURRENCY GUARD RELEASE
+             * 🔥 MEMORY SAFETY (NON-NEGOTIABLE)
              * ================================================================
-             * Must ALWAYS execute to avoid permanent lock‑out.
+             * The frozen frame MUST ALWAYS be recycled:
+             * - Success
+             * - Failure
+             * - Exception
              */
+            frameBitmap.recycle()
+
+            /* ================================================================
+             * 🔓 RELEASE CONCURRENCY GUARD
+             * ================================================================ */
             isProcessing.set(false)
         }
     }
