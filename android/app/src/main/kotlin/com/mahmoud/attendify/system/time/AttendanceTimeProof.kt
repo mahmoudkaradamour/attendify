@@ -18,22 +18,20 @@ package com.mahmoud.attendify.system.time
  * - Once created, it must never be modified.
  */
 data class AttendanceTimeProof(
-
     /**
-     * UTC timestamp used for attendance (wall clock).
+     * UTC timestamp used for attendance.
      * Anchored and drift-checked.
      */
     val utcTimestampMillis: Long,
 
     /**
-     * Monotonic clock snapshot (milliseconds since boot).
-     * Used for tamper detection.
+     * Monotonic clock snapshot.
+     * Used to detect time rollback / replay.
      */
     val elapsedRealtimeMillis: Long,
 
     /**
      * Device uptime at the moment of attendance.
-     * Secondary integrity signal.
      */
     val uptimeMillis: Long,
 
@@ -44,48 +42,58 @@ data class AttendanceTimeProof(
     val bootId: String,
 
     /**
-     * Device timezone ID at time of attendance.
-     * Compared against administrative policy.
+     * Device timezone ID.
+     * Must match administrative policy.
      */
     val timeZoneId: String,
 
     /**
-     * Genesis anchor wall-clock time (UTC).
-     * Obtained from backend during mandatory initial handshake.
+     * Genesis anchor wall-clock time.
      */
     val anchorWallClockMillis: Long,
 
     /**
      * Genesis anchor monotonic time.
-     * Used to calculate time drift.
      */
     val anchorElapsedMillis: Long,
 
     /**
-     * Absolute time drift in milliseconds.
-     * |ΔWallClock − ΔElapsedRealtime|
+     * Absolute anchor-based drift in milliseconds.
      */
     val driftMillis: Long,
 
     /**
      * Final integrity verdict produced by TimeIntegrityGuard.
-     * (OK / Blocked / Tampered)
      */
     val verificationResult: TimeIntegrityResult,
 
     /**
      * Optional GPS-based UTC timestamp.
-     *
-     * Acts only as an integrity witness (forensic signal),
-     * NEVER as a standalone acceptance factor.
+     * NEVER used as a primary acceptance factor.
      */
     val gpsUtcMillis: Long?,
 
     /**
-     * Cryptographic signature of the deterministic payload.
+     * 🔐 FORENSIC FLAG
      *
+     * Indicates whether biometric liveness checks
+     * were EXECUTED for this attendance attempt.
+     *
+     * IMPORTANT:
+     * - This is NOT an input from Flutter.
+     * - This is NOT derived later.
+     * - This value is bound cryptographically to the timestamp.
+     *
+     * Purpose:
+     * - Prevent administrative collusion.
+     * - Prevent replay of older "liveness=true" proofs.
+     * - Provide court-defensible evidence.
+     */
+    val wasLivenessExecuted: Boolean,
+
+    /**
+     * Cryptographic signature of the deterministic payload.
      * Generated using Android Keystore.
-     * Proves authenticity and prevents record tampering.
      */
     val signature: String
 )

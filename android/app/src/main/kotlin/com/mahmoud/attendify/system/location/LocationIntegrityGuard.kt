@@ -147,23 +147,63 @@ class LocationIntegrityGuard(
         }
 
         /* ==================================================
-         * 7️⃣ ZONE EVALUATION
+         * 7️⃣ ZONE EVALUATION (ADMINISTRATIVE CONTEXT)
          * ================================================== */
         val zoneDecision = evaluateZones(
             snapshot.latitude,
             snapshot.longitude
         )
 
-        if (zoneDecision != null) {
-            when (zoneDecision.policy) {
-                ZonePolicy.BLOCK ->
-                    return LocationIntegrityResult.Blocked(
-                        reason = "Blocked by zone policy"
-                    )
+        if (zoneDecision != null && zoneDecision.policy == ZonePolicy.BLOCK) {
 
-                ZonePolicy.ALLOW_WITH_JUSTIFICATION -> Unit
-                ZonePolicy.ALLOW -> Unit
+            /*
+             * 🔒 STEP 1.2 — NETWORK HARD RULE
+             *
+             * Inside BLOCK zones:
+             * - GPS location == spatial proof → hard block
+             * - Network location == contextual claim → allowed WITH EVIDENCE
+             *
+             * This prevents:
+             * - Phantom Wi‑Fi attacks
+             * - BSSID spoofing
+             * - Silent false presence
+             *
+             * Without breaking operational continuity.
+             */
+            val isNetworkProvider =
+                snapshot.provider.equals("network", ignoreCase = true)
+
+            if (isNetworkProvider) {
+
+                anchorStorage.saveLastLocation(snapshot)
+
+                val evidence = LocationEvidence(
+                    latitude = if (snapshot.isMock) null else snapshot.latitude,
+                    longitude = if (snapshot.isMock) null else snapshot.longitude,
+                    accuracyMeters = snapshot.accuracyMeters,
+                    provider = snapshot.provider,
+
+                    isMockDetected = snapshot.isMock,
+                    isStale = false,
+                    teleportDetected = teleportDetected,
+
+                    distanceToAllowedZoneMeters = zoneDecision.distanceMeters,
+                    zoneDecision = zoneDecision,
+
+                    policyDecision = LocationDecision.ALLOWED_WITH_EVIDENCE,
+                    justificationRequired = true,
+
+                    networkContext = networkContext,
+                    timestampMillis = snapshot.timestampMillis,
+                    signature = LocationSigner.sign(snapshot.toString())
+                )
+
+                return LocationIntegrityResult.Allowed(evidence)
             }
+
+            return LocationIntegrityResult.Blocked(
+                reason = "Blocked by zone policy"
+            )
         }
 
         /* ==================================================

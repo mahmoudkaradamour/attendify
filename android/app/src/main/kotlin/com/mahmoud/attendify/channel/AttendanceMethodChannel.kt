@@ -12,82 +12,143 @@ import com.mahmoud.attendify.attendance.domain.AttendanceResult
 import com.mahmoud.attendify.orchestration.AttendanceRuntimeOrchestrator
 
 /**
+ * ============================================================================
  * AttendanceMethodChannel
- *
  * ============================================================================
+ *
  * ROLE:
- * ============================================================================
- * ✅ Flutter ⇄ Native asynchronous bridge
- * ✅ Data mapping only
+ * ----------------------------------------------------------------------------
+ * This class is a **strict Flutter ⇄ Native bridge**.
  *
- * IMPORTANT NON‑NEGOTIABLE RULES:
- * ============================================================================
- * ❌ No business logic
- * ❌ No ML calls
- * ❌ No policy inference
- * ❌ No camera or bitmap handling
+ * It exists ONLY to:
+ *  - Receive method calls from Flutter
+ *  - Validate and map primitive arguments
+ *  - Invoke native domain orchestration
+ *  - Return explicit results back to Flutter
  *
- * This layer:
- *  - Translates Flutter arguments → domain inputs
- *  - Invokes suspend orchestration safely
- *  - Serializes explicit AttendanceResult back to Flutter
+ * ----------------------------------------------------------------------------
+ * WHAT THIS CLASS MUST NEVER DO:
+ * ----------------------------------------------------------------------------
+ * ❌ Accept user identity (employeeId, userId, etc.)
+ * ❌ Execute business logic
+ * ❌ Perform biometric operations
+ * ❌ Access camera, ML models, or location services
+ * ❌ Apply policy decisions
  *
- * All decisions MUST already be encoded in AttendanceResult.
+ * ----------------------------------------------------------------------------
+ * SECURITY MODEL (Phase 3.1 – Zero Trust UI):
+ * ----------------------------------------------------------------------------
+ * 🔒 Flutter is considered UNTRUSTED
+ * 🔒 Identity is resolved ONLY inside Native secure storage
+ * 🔒 All evidence and decisions are Native‑owned
+ *
+ * This layer is intentionally:
+ *  - Thin
+ *  - Explicit
+ *  - Stupid by design
+ *
+ * Any intelligence here would be a security violation.
  */
 class AttendanceMethodChannel(
     private val runtimeOrchestrator: AttendanceRuntimeOrchestrator
 ) : MethodChannel.MethodCallHandler {
 
     /**
-     * Coroutine scope bound to Main thread.
+     * CoroutineScope bound to the MAIN thread.
      *
-     * WHY Main?
-     * ----------
-     * - MethodChannel callbacks must return on main thread
-     * - Heavy work is safely suspended inside orchestrator/usecases
+     * TECHNICAL JUSTIFICATION:
+     * ------------------------------------------------------------------------
+     * - MethodChannel callbacks MUST respond on the main thread.
+     * - Heavy work MUST NOT block the main thread.
+     *
+     * HOW THIS IS SAFE:
+     * ------------------------------------------------------------------------
+     * - attemptAttendance(...) is a suspend function
+     * - Its heavy work is internally dispatched (camera, ML, IO)
+     * - The main thread only coordinates suspension/resumption
      */
     private val scope =
         CoroutineScope(Dispatchers.Main)
 
+    /**
+     * =========================================================================
+     * onMethodCall
+     * =========================================================================
+     *
+     * Entry point from Flutter.
+     *
+     * RULES:
+     * ------------------------------------------------------------------------
+     * ✅ Route by method name only
+     * ✅ Delegate real work to private handlers
+     * ❌ No logic branching beyond routing
+     */
     override fun onMethodCall(
         call: MethodCall,
         result: MethodChannel.Result
     ) {
         when (call.method) {
 
+            /**
+             * Primary attendance entry point.
+             *
+             * Flutter sends:
+             *  - action: String ("CHECK_IN" / "CHECK_OUT")
+             *
+             * Flutter does NOT send:
+             *  - employeeId
+             *  - timestamps
+             *  - location
+             */
             "startAttendance" ->
                 handleStartAttendance(call, result)
 
+            /**
+             * Optional cancel signal.
+             *
+             * NOTE:
+             * In the current architecture, cancellation is best‑effort.
+             * The call exists mainly for UI symmetry.
+             */
             "cancelAttendance" ->
                 result.success(true)
 
+            /**
+             * Any unknown method is explicitly rejected.
+             */
             else ->
                 result.notImplemented()
         }
     }
 
     /**
-     * handleStartAttendance
-     *
      * =========================================================================
-     * Validates Flutter input, then launches attendance asynchronously.
+     * handleStartAttendance
+     * =========================================================================
+     *
+     * PURPOSE:
+     * ------------------------------------------------------------------------
+     * - Extract and validate Flutter arguments
+     * - Translate them into domain types
+     * - Cross the coroutine boundary safely
+     *
+     * SECURITY CONTRACT:
+     * ------------------------------------------------------------------------
+     * ✅ Accepts ONLY high‑level intent
+     * ❌ Accepts NO identity, evidence, or state
      */
     private fun handleStartAttendance(
         call: MethodCall,
         result: MethodChannel.Result
     ) {
 
-        val employeeId =
-            call.argument<String>("employeeId")
-                ?: run {
-                    result.error(
-                        "INVALID_ARGS",
-                        "employeeId missing",
-                        null
-                    )
-                    return
-                }
-
+        /**
+         * Extract attendance action from Flutter.
+         *
+         * REQUIRED:
+         * - action must exist
+         * - action must match AttendanceAction enum
+         */
         val actionName =
             call.argument<String>("action")
                 ?: run {
@@ -112,27 +173,50 @@ class AttendanceMethodChannel(
             }
 
         /**
-         * ✅ COROUTINE BOUNDARY (Stage 0.3)
+         * ✅ COROUTINE BOUNDARY
          *
-         * - Orchestrator is suspend
-         * - Never block MethodChannel thread
+         * WHY THIS MATTERS:
+         * --------------------------------------------------------------------
+         * - Flutter ↔ Native calls must never block
+         * - Biometric pipelines are slow by nature
+         * - Suspending preserves UI responsiveness
          */
         scope.launch {
 
             try {
 
+                /**
+                 * Delegate EVERYTHING to the Runtime Orchestrator.
+                 *
+                 * This is the ONLY place where:
+                 *  - camera
+                 *  - face recognition
+                 *  - liveness
+                 *  - location integrity
+                 * are coordinated.
+                 */
                 val attendanceResult =
                     runtimeOrchestrator.attemptAttendance(
-                        action = action,
-                        employeeId = employeeId
+                        action = action
                     )
 
+                /**
+                 * Serialize the explicit final result
+                 * and return it to Flutter.
+                 */
                 result.success(
                     serializeResult(attendanceResult)
                 )
 
             } catch (t: Throwable) {
 
+                /**
+                 * Any uncaught native exception is mapped
+                 * to a generic platform error.
+                 *
+                 * SECURITY NOTE:
+                 * We do NOT leak stack traces or internal details.
+                 */
                 result.error(
                     "NATIVE_ERROR",
                     t.message ?: "Unknown native error",
@@ -143,15 +227,27 @@ class AttendanceMethodChannel(
     }
 
     /**
-     * serializeResult
-     *
      * =========================================================================
-     * Converts AttendanceResult → simple Map for Flutter.
+     * serializeResult
+     * =========================================================================
      *
-     * Justification:
-     * --------------
-     * - Policy interpretation is NOT done here
-     * - Flutter receives explicit domain output only
+     * Converts a strongly‑typed AttendanceResult
+     * into a minimal, explicit Map for Flutter.
+     *
+     * DESIGN PRINCIPLES:
+     * ------------------------------------------------------------------------
+     * ✅ Deterministic
+     * ✅ No interpretation
+     * ✅ No derived signals
+     *
+     * Flutter receives:
+     *  - Final decision
+     *  - Human‑readable explanation (if any)
+     *
+     * Flutter does NOT receive:
+     *  - Confidence scores
+     *  - Thresholds
+     *  - Internal state
      */
     private fun serializeResult(
         result: AttendanceResult
@@ -163,7 +259,6 @@ class AttendanceMethodChannel(
                     put("status", "ACCEPTED")
                     put("action", result.action.name)
 
-                    // Included ONLY if domain explicitly attached it
                     result.justification?.let {
                         put("justification", it.text)
                     }

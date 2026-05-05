@@ -2,196 +2,263 @@ package com.mahmoud.attendify.orchestration
 
 import java.util.concurrent.atomic.AtomicBoolean
 
+/* ============================================================================
+ * DOMAIN
+ * ========================================================================== */
 import com.mahmoud.attendify.attendance.domain.AttendanceAction
 import com.mahmoud.attendify.attendance.domain.AttendanceResult
 import com.mahmoud.attendify.attendance.usecase.AttendanceUseCase
 
-import com.mahmoud.attendify.camera.CameraManager
+/* ============================================================================
+ * CAMERA / IMAGE QUALITY
+ * ========================================================================== */
 import com.mahmoud.attendify.camera.ImageQualityChecker
 import com.mahmoud.attendify.camera.SystemStatus
 
+/* ============================================================================
+ * FACE PIPELINE
+ * ========================================================================== */
 import com.mahmoud.attendify.face.FaceCropper
 import com.mahmoud.attendify.face.FaceDetector
 import com.mahmoud.attendify.face.MobileFaceNet
 
+/* ============================================================================
+ * LIVENESS (OPTIONAL)
+ * ========================================================================== */
 import com.mahmoud.attendify.liveness.LivenessOrchestrator
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
 import com.mahmoud.attendify.liveness.result.LivenessResult
 
-import com.mahmoud.attendify.matching.FaceMatchingUseCase
+/* ============================================================================
+ * MATCHING
+ * ========================================================================== */
+import com.mahmoud.attendify.matching.FaceMatchingOrchestrator
 import com.mahmoud.attendify.matching.MatchDecision
 
+/* ============================================================================
+ * ATOMIC CONTEXT / SNAPSHOT
+ * ========================================================================== */
+import com.mahmoud.attendify.orchestration.context.AttendanceAtomicContext
+import com.mahmoud.attendify.orchestration.context.SignedPhysicalRealitySnapshot
+
+/* ============================================================================
+ * SECURITY
+ * ========================================================================== */
+import com.mahmoud.attendify.security.ReplayProtectionGuard
+import com.mahmoud.attendify.security.SecureEmployeeSession
+
+/* ============================================================================
+ * FORENSICS (PHASE 3.4 + 3.5)
+ * ========================================================================== */
+import com.mahmoud.attendify.forensics.ForensicAuditTrailWriter
+import com.mahmoud.attendify.forensics.EvidenceNormalizer
+
 /**
+ * ============================================================================
  * AttendanceRuntimeOrchestrator
+ * ============================================================================
+ *
+ * ROLE:
+ * ----------------------------------------------------------------------------
+ * Single trusted runtime coordinator for ONE attendance attempt.
+ *
+ * Responsibilities:
+ *  ✅ Orchestrates execution flow
+ *  ✅ Enforces security gates
+ *  ✅ Consumes signed, atomic physical snapshots
+ *  ✅ Triggers forensic persistence AFTER final decision
+ *
+ * Explicit Non‑Responsibilities:
+ *  ❌ Capture physical reality
+ *  ❌ Validate time or location
+ *  ❌ Normalize evidence
+ *  ❌ Make final administrative decisions
+ *
+ * FINAL DECISION AUTHORITY:
+ * ----------------------------------------------------------------------------
+ * AttendanceUseCase
  *
  * ============================================================================
- * ROLE (FINAL & SEALED):
+ * HIGH‑LEVEL FORENSIC FLOW (POST PHASE 3.5)
  * ============================================================================
- * Coordinates the COMPLETE attendance pipeline using
- * EXACTLY ONE camera frame obtained via CameraManager.
  *
- * This class is PURE ORCHESTRATION:
- *  ✅ No Camera HAL access
- *  ✅ No frame streaming
- *  ✅ No business rules
- *  ✅ No policy decisions
- *
- * All DECISIONS are delegated to:
- *  - LivenessOrchestrator
- *  - FaceMatchingUseCase
- *  - AttendanceUseCase (FINAL AUTHORITY)
+ * SignedPhysicalRealitySnapshot
+ *             │
+ *             ▼
+ * AttendanceRuntimeOrchestrator
+ *             │
+ *             ▼
+ * AttendanceResult (FINAL)
+ *             │
+ *             ▼
+ * EvidenceNormalizer
+ *             │
+ *             ▼
+ * NormalizedForensicEvidence
+ *             │
+ *             ▼
+ * ForensicAuditTrailWriter
  *
  * ============================================================================
- * SECURITY GUARANTEES:
+ * SECURITY & FORENSIC GUARANTEES
  * ============================================================================
- * Stage 0.1:
- *  ✅ Frame Freeze (single immutable bitmap)
- *  ✅ Camera HAL Circuit Breaker respected
  *
- * Stage 0.2:
- *  ✅ No retry storms (guarded upstream)
- *  ✅ Deterministic sequencing
+ * ✅ Atomic Reality (no TOCTOU)
+ * ✅ Replay Protection (nonce‑based)
+ * ✅ Tamper Evidence (signed snapshots)
+ * ✅ Privacy‑by‑Design (normalized evidence)
+ * ✅ Append‑only forensic ledger
+ * ✅ Single‑flight execution
  *
- * Stage 0.3:
- *  ✅ Proper suspend boundary
- *  ✅ No blocking calls
- *  ✅ Safe coroutine interoperability
- *
- * Any change here MUST be security-reviewed.
+ * Any violation → AttendanceResult.Blocked
  */
 class AttendanceRuntimeOrchestrator(
 
-    /* ---------------- CAMERA ---------------- */
-    private val cameraManager: CameraManager,
+    /* ========================================================================
+     * ATOMIC REALITY PROVIDER (SINGLE AUTHORITY)
+     * ======================================================================== */
+    private val physicalRealityBuilder: PhysicalRealityBuilder,
 
-    /* ---------------- FACE ---------------- */
+    /* ========================================================================
+     * FACE PIPELINE
+     * ======================================================================== */
     private val faceDetector: FaceDetector,
     private val faceNet: MobileFaceNet,
 
-    /* -------------- LIVENESS -------------- */
-    private val livenessOrchestrator: LivenessOrchestrator?, // Nullable by policy
+    /* ========================================================================
+     * LIVENESS (OPTIONAL)
+     * ======================================================================== */
+    private val livenessOrchestrator: LivenessOrchestrator?,
     private val facialMetricsEngine: FacialMetricsEngine,
 
-    /* --------------- MATCHING ------------- */
-    private val faceMatchingUseCase: FaceMatchingUseCase,
+    /* ========================================================================
+     * FACE MATCHING (SINGLE ENTRY POINT)
+     * ======================================================================== */
+    private val faceMatchingOrchestrator: FaceMatchingOrchestrator,
 
-    /* ------------- ATTENDANCE ------------- */
-    private val attendanceUseCase: AttendanceUseCase
+    /* ========================================================================
+     * FINAL ADMINISTRATIVE AUTHORITY
+     * ======================================================================== */
+    private val attendanceUseCase: AttendanceUseCase,
+
+    /* ========================================================================
+     * FORENSIC AUDIT TRAIL (PHASE 3.4 + 3.5)
+     * ======================================================================== */
+    private val auditTrailWriter: ForensicAuditTrailWriter
 ) {
 
     /**
-     * Concurrency guard (fail-fast).
+     * Strict single‑flight guard.
      *
-     * WHY AtomicBoolean HERE?
-     * -----------------------
-     * - Protects Camera + ML from parallel execution
-     * - Prevents rapid user button spam
-     * - Reduces thermal / memory pressure
-     *
-     * IMPORTANT:
-     * ----------
-     * This is an OUTER guard.
-     * A SECOND, STRONGER Mutex exists INSIDE AttendanceUseCase (Stage 0.2).
-     * The two layers serve different purposes and do NOT conflict.
+     * Prevents:
+     * - Parallel attendance attempts
+     * - Evidence interleaving
+     * - Context contamination
      */
     private val isProcessing = AtomicBoolean(false)
 
     /**
+     * =========================================================================
      * attemptAttendance
-     *
-     * =========================================================================
-     * SINGLE ENTRY POINT
      * =========================================================================
      *
-     * Executes a FULL attendance attempt.
+     * Executes exactly ONE attendance attempt.
      *
-     * ❗ This function MUST be suspended (Stage 0.3):
-     * ---------------------------------------------
-     * - Calls suspend AttendanceUseCase
-     * - Performs heavy ML work
-     * - Must not block threads
-     *
-     * IMPORTANT SECURITY RULES:
-     * -------------------------
-     * - Camera frame is obtained HERE and ONLY HERE
-     * - No external Bitmap injection is allowed
-     * - This completely closes the Frame Slippage exploit
-     *
-     * @param action     CHECK_IN / CHECK_OUT
-     * @param employeeId Target employee identifier
+     * Trust Model:
+     * ------------------------------------------------------------------------
+     * ✅ Action comes from UI (intent only)
+     * ✅ Identity resolved natively
+     * ❌ No user‑supplied evidence
      */
     suspend fun attemptAttendance(
-        action: AttendanceAction,
-        employeeId: String
+        action: AttendanceAction
     ): AttendanceResult {
 
-        /* ================================================================
-         * 🔒 CONCURRENCY GUARD (ABSOLUTE FIRST)
-         * ================================================================ */
+        /* ====================================================================
+         * CONCURRENCY GATE
+         * ==================================================================== */
         if (!isProcessing.compareAndSet(false, true)) {
             return AttendanceResult.Blocked(
                 reason = "Attendance already in progress"
             )
         }
 
-        /* ================================================================
-         * 🧊 FRAME FREEZE + HARDWARE CIRCUIT BREAKER
-         * ================================================================
-         * - Exactly ONE frame
-         * - Time-bounded
-         * - No camera streaming
-         */
-        val frameBitmap =
-            cameraManager.captureSingleFrame(timeoutMs = 2000)
-                ?: run {
-                    isProcessing.set(false)
-                    return AttendanceResult.Blocked(
-                        reason = "Camera hardware not responding"
-                    )
-                }
+        val employeeId =
+            SecureEmployeeSession.requireEmployeeId()
 
         try {
 
             /* ================================================================
-             * 1️⃣ IMAGE QUALITY GATE
-             * ================================================================
-             * Reject unusable frames EARLY:
-             * - Very dark / bright
-             * - Too blurry
-             * - Corrupted frame
-             */
-            val imageStatus =
-                ImageQualityChecker.checkFrame(frameBitmap)
+             * STEP 0 — SIGNED, SINGLE‑USE PHYSICAL REALITY
+             * ================================================================ */
+            val signedSnapshot: SignedPhysicalRealitySnapshot =
+                physicalRealityBuilder
+                    .buildSignedOrFail(timeoutMs = 2000)
+                    .getOrElse {
+                        return AttendanceResult.Blocked(
+                            reason = it.message ?: "Physical capture failed"
+                        )
+                    }
 
-            if (imageStatus != SystemStatus.OK) {
+            /* ================================================================
+             * REPLAY ATTACK DEFENSE
+             * ================================================================ */
+            if (
+                !ReplayProtectionGuard
+                    .registerOrReject(signedSnapshot.snapshotId)
+            ) {
                 return AttendanceResult.Blocked(
-                    reason = "Image quality check failed: $imageStatus"
+                    reason = "Replay attack detected"
                 )
             }
 
             /* ================================================================
-             * 2️⃣ FACE DETECTION (SINGLE FACE POLICY)
+             * BUILD ATOMIC CONTEXT
              * ================================================================ */
-            val detection =
-                faceDetector.detectBestFace(frameBitmap)
-                    ?: return AttendanceResult.Blocked(
-                        reason = "No face detected"
-                    )
+            val atomicContext =
+                AttendanceAtomicContext(
+                    frozenFrame = signedSnapshot.payload.frozenFrame,
+                    timeSnapshot = signedSnapshot.payload.timeSnapshot,
+                    locationEvidence = signedSnapshot.payload.locationEvidence
+                )
 
             /* ================================================================
-             * 3️⃣ FACE CROP (SECURITY-AWARE)
+             * IMAGE QUALITY
+             * ================================================================ */
+            if (
+                ImageQualityChecker.checkFrame(
+                    atomicContext.frozenFrame
+                ) != SystemStatus.OK
+            ) {
+                return AttendanceResult.Blocked(
+                    reason = "Image quality check failed"
+                )
+            }
+
+            /* ================================================================
+             * FACE DETECTION
+             * ================================================================ */
+            val detection =
+                faceDetector.detectBestFace(
+                    atomicContext.frozenFrame
+                ) ?: return AttendanceResult.Blocked(
+                    reason = "No face detected"
+                )
+
+            /* ================================================================
+             * FACE CROP & NORMALIZATION
              * ================================================================ */
             val faceBitmap =
                 FaceCropper.cropAndResize(
-                    sourceBitmap = frameBitmap,
-                    faceBox = detection.box,
-                    targetSize = 112 // MobileFaceNet input size
+                    atomicContext.frozenFrame,
+                    detection.box,
+                    112
                 ) ?: return AttendanceResult.Blocked(
                     reason = "Face crop failed"
                 )
 
             /* ================================================================
-             * 4️⃣ LIVENESS (OPTIONAL, BUT AUDITED)
+             * OPTIONAL LIVENESS
              * ================================================================ */
             val livenessExecuted =
                 livenessOrchestrator != null
@@ -204,10 +271,10 @@ class AttendanceRuntimeOrchestrator(
 
                 livenessOrchestrator.onFrame(metricsFrame)
 
-                val livenessResult =
+                if (
                     livenessOrchestrator.evaluate()
-
-                if (livenessResult is LivenessResult.SpoofDetected) {
+                            is LivenessResult.SpoofDetected
+                ) {
                     return AttendanceResult.Blocked(
                         reason = "Liveness check failed"
                     )
@@ -215,56 +282,49 @@ class AttendanceRuntimeOrchestrator(
             }
 
             /* ================================================================
-             * 5️⃣ FACE EMBEDDING (DETERMINISTIC)
+             * FACE MATCHING
              * ================================================================ */
-            val embedding = try {
-                faceNet.getEmbedding(faceBitmap)
-            } catch (_: Exception) {
-                return AttendanceResult.Blocked(
-                    reason = "Face embedding extraction failed"
-                )
-            }
-
-            /* ================================================================
-             * 6️⃣ FACE MATCHING (POLICY-DRIVEN)
-             * ================================================================ */
-            val matchDecision =
-                faceMatchingUseCase.matchNow(
-                    liveEmbedding = embedding,
-                    employeeId = employeeId
-                )
-
-            if (matchDecision !is MatchDecision.MatchSuccess) {
+            if (
+                faceMatchingOrchestrator.performMatch(
+                    liveEmbedding = faceNet.getEmbedding(faceBitmap),
+                    employeeId = employeeId,
+                    groupThreshold = null
+                ) !is MatchDecision.MatchSuccess
+            ) {
                 return AttendanceResult.Blocked(
                     reason = "Face matching failed"
                 )
             }
 
             /* ================================================================
-             * 7️⃣ FINAL ADMINISTRATIVE ATTENDANCE DECISION
-             * ================================================================
-             * Delegates to AttendanceUseCase
-             * (Stage 0.2 — Mutex + Timeout enforced there)
-             */
-            return attendanceUseCase.attempt(
-                action = action,
-                livenessExecuted = livenessExecuted
+             * FINAL ADMINISTRATIVE DECISION
+             * ================================================================ */
+            val result =
+                attendanceUseCase.attempt(
+                    action = action,
+                    atomicContext = atomicContext,
+                    livenessExecuted = livenessExecuted
+                )
+
+            /* ================================================================
+             * PHASE 3.5 — NORMALIZATION & FORENSIC PERSISTENCE
+             * ================================================================ */
+            val normalizedEvidence =
+                EvidenceNormalizer.normalize(
+                    snapshot = signedSnapshot,
+                    result = result
+                )
+
+            auditTrailWriter.append(
+                evidence = normalizedEvidence
             )
+
+            return result
 
         } finally {
 
             /* ================================================================
-             * 🔥 MEMORY SAFETY (NON-NEGOTIABLE)
-             * ================================================================
-             * The frozen frame MUST ALWAYS be recycled:
-             * - Success
-             * - Failure
-             * - Exception
-             */
-            frameBitmap.recycle()
-
-            /* ================================================================
-             * 🔓 RELEASE CONCURRENCY GUARD
+             * RELEASE SINGLE‑FLIGHT GUARD
              * ================================================================ */
             isProcessing.set(false)
         }
