@@ -6,157 +6,172 @@ import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Bundle
+import android.os.Handler
 import android.os.SystemClock
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
 /**
- * LocationSource
+ * ============================================================================
+ * LocationSource — FINAL (Military‑Grade Implementation)
+ * ============================================================================
  *
- * PURPOSE:
- * --------
- * Provides a SINGLE, FRESH, HARD GPS location fix under Zero‑Trust assumptions.
+ * ROLE:
+ * ----------------------------------------------------------------------------
+ * Provides a SINGLE, FRESH, REAL GPS fix under Zero‑Trust assumptions.
  *
- * SECURITY DESIGN PRINCIPLES:
- * ---------------------------
- * 1. Cached locations are FORBIDDEN.
- * 2. getLastLocation() is NEVER used (cached mock attack).
- * 3. A real GPS sensor fix must be forced.
- * 4. Location freshness and age are evaluated later by LocationIntegrityGuard.
+ * This class is the ONLY component allowed to:
+ *  - Interact directly with Android LocationManager
+ *  - Request GPS-level location fixes
+ *  - Reject cached or stale location data
  *
- * WHY THIS CLASS EXISTS:
- * ----------------------
- * Android Location APIs are optimized for battery, not security.
- * This class exists to override Android's default "helpful" behavior
- * and enforce a security‑first location acquisition model.
+ * ============================================================================
+ * SECURITY DESIGN PRINCIPLES
+ * ============================================================================
+ *
+ * ✅ NO cached locations (NO getLastKnownLocation)
+ * ✅ NO fused provider shortcuts
+ * ✅ Forced GPS hardware interaction
+ * ✅ Exactly ONE location per request
+ * ✅ Deterministic: either success or explicit failure
+ *
+ * ============================================================================
+ * CRITICAL GUARANTEES
+ * ============================================================================
+ *
+ * ✅ Always attempts fresh fix from GPS chip
+ * ✅ No reuse of previous session location
+ * ✅ Single callback → single result (write-once semantics)
+ * ✅ No blocking threads (fully coroutine-based)
+ * ✅ Safe cancellation handling
+ * ✅ No ghost timeout execution
+ *
+ * ============================================================================
  */
-class LocationSource(private val context: Context) {
+class LocationSource(
+    private val context: Context
+) {
 
     /**
-     * Attempts to obtain a SINGLE fresh GPS location fix.
-     *
-     * @param timeoutSeconds Maximum time to wait for a GPS fix before failing.
-     *
-     * @return LocationSnapshot if a fresh fix is obtained,
-     *         null if GPS is unavailable, disabled, or times out.
-     *
-     * BEHAVIORAL GUARANTEES:
-     * ---------------------
-     * ✔ Forces the GPS chip to warm up and acquire satellites.
-     * ✔ Ignores Android's cached / last known locations entirely.
-     * ✔ Works on API 28+ (no getCurrentLocation dependency).
-     * ✔ Deterministic: either returns a fix or fails explicitly.
+     * Requests a SINGLE fresh GPS fix.
      */
     @SuppressLint("MissingPermission")
-    fun getFreshLocation(timeoutSeconds: Long = 30): LocationSnapshot? {
+    suspend fun awaitFreshLocation(
+        timeoutMs: Long
+    ): LocationSnapshot? {
 
-        // Acquire Android's low‑level LocationManager.
-        // We use it instead of FusedLocationProvider to avoid
-        // aggressive caching and abstraction layers.
         val locationManager =
-            context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            context.getSystemService(Context.LOCATION_SERVICE)
+                    as? LocationManager
                 ?: return null
 
-        /**
-         * CountDownLatch is used to convert Android's async
-         * location callbacks into a deterministic blocking operation.
-         *
-         * This is SAFE here because:
-         * - The call is executed only during attendance initiation.
-         * - The timeout is strictly bounded by policy.
-         * - Security > UX at this stage.
-         */
-        val latch = CountDownLatch(1)
-        var result: Location? = null
+        return suspendCancellableCoroutine { continuation ->
 
-        /**
-         * LocationListener that will receive exactly ONE update,
-         * then immediately unregister itself.
-         */
-        val listener = object : LocationListener {
+            var delivered = false // ✅ single-delivery guard
 
-            override fun onLocationChanged(location: Location) {
-                // A fresh GPS fix has been received.
-                result = location
-                latch.countDown()
-                locationManager.removeUpdates(this)
+            val handler = Handler(context.mainLooper)
+
+            val listener = object : LocationListener {
+
+                override fun onLocationChanged(location: Location) {
+
+                    if (!delivered) {
+                        delivered = true
+
+                        locationManager.removeUpdates(this)
+                        handler.removeCallbacksAndMessages(null) // ✅ prevent timeout firing later
+
+                        val snapshot = buildSnapshot(location)
+
+                        if (continuation.isActive) {
+                            continuation.resume(snapshot)
+                        }
+                    }
+                }
+
+                override fun onProviderDisabled(provider: String) {
+
+                    if (!delivered) {
+                        delivered = true
+
+                        locationManager.removeUpdates(this)
+                        handler.removeCallbacksAndMessages(null)
+
+                        if (continuation.isActive) {
+                            continuation.resume(null)
+                        }
+                    }
+                }
+
+                override fun onProviderEnabled(provider: String) {}
+
+                /**
+                 * Deprecated but required by API
+                 */
+                @Suppress("DEPRECATION")
+                override fun onStatusChanged(
+                    provider: String?,
+                    status: Int,
+                    extras: Bundle?
+                ) {
+                    // No logic required
+                }
             }
 
-            override fun onProviderDisabled(provider: String) {
-                // GPS was disabled while waiting.
-                latch.countDown()
+            /* =============================================================
+             * 🔐 FORCE REAL GPS FIX
+             * ============================================================= */
+            locationManager.requestLocationUpdates(
+                LocationManager.GPS_PROVIDER,
+                0L,
+                0f,
+                listener
+            )
+
+            /* =============================================================
+             * ⏱️ TIMEOUT HANDLER
+             * ============================================================= */
+            val timeoutRunnable = Runnable {
+
+                if (!delivered) {
+                    delivered = true
+
+                    locationManager.removeUpdates(listener)
+
+                    if (continuation.isActive) {
+                        continuation.resume(null)
+                    }
+                }
             }
 
-            override fun onProviderEnabled(provider: String) {
-                // No action needed.
-            }
+            handler.postDelayed(timeoutRunnable, timeoutMs)
 
-            override fun onStatusChanged(
-                provider: String?,
-                status: Int,
-                extras: Bundle?
-            ) {
-                // Deprecated but required for backward compatibility.
+            /* =============================================================
+             * 🔄 CANCELLATION SAFETY
+             * ============================================================= */
+            continuation.invokeOnCancellation {
+                locationManager.removeUpdates(listener)
+                handler.removeCallbacksAndMessages(null)
             }
         }
+    }
 
-        /**
-         * 🔐 CRITICAL SECURITY STEP
-         * ------------------------
-         * requestLocationUpdates() FORCES a real GPS update.
-         *
-         * - minTime = 0
-         * - minDistance = 0
-         *
-         * This configuration tells Android:
-         * "I want a brand‑new fix NOW, not something from cache."
-         *
-         * This single line kills:
-         * - Cached Mock Attack
-         * - Replay of last known location
-         */
-        locationManager.requestLocationUpdates(
-            LocationManager.GPS_PROVIDER,
-            0L,
-            0f,
-            listener
-        )
+    /* =========================================================================
+     * SNAPSHOT BUILDER
+     * ========================================================================= */
 
-        // Wait for a GPS fix or until timeout expires.
-        latch.await(timeoutSeconds, TimeUnit.SECONDS)
+    private fun buildSnapshot(location: Location): LocationSnapshot {
 
-        // Always clean up listener defensively.
-        locationManager.removeUpdates(listener)
-
-        val location = result ?: return null
-
-        /**
-         * SECURITY NOTE – Mock Location Flag
-         * ---------------------------------
-         * isFromMockProvider() is officially deprecated,
-         * BUT there is NO system‑level replacement.
-         *
-         * We deliberately keep using it as a RISK SIGNAL,
-         * NOT as a source of truth.
-         */
         @Suppress("DEPRECATION")
         val isMock = location.isFromMockProvider
 
-        /**
-         * We intentionally capture elapsedRealtime at the moment
-         * THIS snapshot is created.
-         *
-         * Later, LocationIntegrityGuard will compare this value
-         * against SystemClock.elapsedRealtime() to detect:
-         * - Stale fixes
-         * - Faraday / offline replay attacks
-         */
         return LocationSnapshot(
             latitude = location.latitude,
             longitude = location.longitude,
             accuracyMeters = location.accuracy,
             provider = location.provider ?: "unknown",
             isMock = isMock,
+
             elapsedRealtimeMillis = SystemClock.elapsedRealtime(),
             timestampMillis = location.time
         )

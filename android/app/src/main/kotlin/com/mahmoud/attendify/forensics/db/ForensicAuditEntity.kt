@@ -1,31 +1,27 @@
-package com.mahmoud.attendify.forensics
+package com.mahmoud.attendify.forensics.db
 
-/**
- * ✅ Immutable forensic record (ledger node)
- *
- * It now includes snapshotHash (D2 requirement)
- */
-data class ForensicAuditRecord(
+import androidx.room.Entity
+import androidx.room.PrimaryKey
 
+@Entity(tableName = "forensic_audit")
+data class ForensicAuditEntity(
+
+    @PrimaryKey
     val index: Long,
+
     val timestampMillis: Long,
     val snapshotId: String,
     val decision: String,
 
-    // ✅ NEW — critical for D2
     val snapshotHash: ByteArray,
-
     val resultHash: ByteArray,
     val previousHash: ByteArray
 
 ) {
 
-    /**
-     * ✅ IMPORTANT: ByteArray requires manual equality
-     */
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
-        if (other !is ForensicAuditRecord) return false
+        if (other !is ForensicAuditEntity) return false
 
         return index == other.index &&
                 timestampMillis == other.timestampMillis &&

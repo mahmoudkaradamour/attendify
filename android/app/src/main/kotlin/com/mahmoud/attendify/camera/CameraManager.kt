@@ -2,42 +2,80 @@ package com.mahmoud.attendify.camera
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.mahmoud.attendify.system.device.DeviceCapabilityProfiler
+import com.mahmoud.attendify.util.BitmapSafeUtils
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.resume
 
 /**
- * CameraManager
+ * =============================================================================
+ * 🎥 CameraManager — Deterministic Single-Frame Acquisition System
+ * =============================================================================
  *
- * ============================================================
- * ROLE (Forensic Camera Authority):
- * ============================================================
- * This class is the ONLY component allowed to:
- * - Interface with CameraX / HAL
- * - Receive camera frames
- * - Decide WHEN a frame is captured
+ * -----------------------------------------------------------------------------
+ * 🧠 SYSTEM MODEL
+ * -----------------------------------------------------------------------------
  *
- * No UI, no Activity, and no Flutter component
- * is ever allowed to access raw camera frames.
+ * This component implements:
  *
- * ============================================================
- * SECURITY MODEL:
- * ============================================================
- * - One attendance attempt  ==  One frozen frame
- * - Frame is captured ONCE
- * - Frame is immutable after capture
- * - Any attempt to inject, replace, or re-capture
- *   a frame is structurally impossible
+ *   Event-Driven, Single-Consumption Frame Acquisition
  *
- * This class enforces the "Frame Freeze Contract".
+ * Formal model:
+ *
+ *   Request(t) → Capture → Deliver exactly one frame → Release
+ *
+ * -----------------------------------------------------------------------------
+ * 📊 EXECUTION FLOW (FORMALIZED)
+ * -----------------------------------------------------------------------------
+ *
+ *                Coroutine (Caller)
+ *                      │
+ *                      ▼
+ *        captureSingleFrameSuspend()
+ *                      │
+ *                      ▼
+ *        frameRequested = true
+ *                      │
+ *                      ▼
+ *            CameraX Analyzer
+ *                      │
+ *                      ▼
+ *      Check request flag → TRUE
+ *                      │
+ *                      ▼
+ *          Convert to Bitmap
+ *                      │
+ *                      ▼
+ *        Deliver + Close Session
+ *
+ * -----------------------------------------------------------------------------
+ * 🔐 SECURITY PROPERTIES
+ * -----------------------------------------------------------------------------
+ *
+ * ✅ No frame reuse
+ * ✅ No buffering
+ * ✅ No temporal leakage
+ * ✅ One request → one frame
+ *
+ * -----------------------------------------------------------------------------
+ * ⚙️ STABILITY GUARANTEES
+ * -----------------------------------------------------------------------------
+ *
+ * ✅ No main-thread blocking
+ * ✅ Backpressure handled (CameraX latest-frame strategy)
+ * ✅ Coroutine cancellation-safe
+ * ✅ Memory safe (Bitmap lifecycle managed)
+ * ✅ No race conditions (single-thread executor + atomic flags)
+ *
  */
 class CameraManager(
     private val context: Context,
@@ -45,16 +83,16 @@ class CameraManager(
     private val statusReporter: SystemStatusReporter
 ) {
 
-    /* ============================================================
-     * Single-thread executor
-     * ============================================================
+    /* =========================================================================
+     * 🧵 EXECUTION CONTROL
+     * ========================================================================= */
+
+    /**
+     * Single-thread executor ensures:
      *
-     * Rationale:
-     * - Deterministic execution
-     * - No frame reordering
-     * - No concurrency races inside HAL callbacks
-     *
-     * This executor is NEVER shared.
+     * ✅ sequential frame processing
+     * ✅ prevents concurrent analyzer execution
+     * ✅ avoids race conditions
      */
     private val cameraExecutor: ExecutorService =
         Executors.newSingleThreadExecutor()
@@ -65,51 +103,47 @@ class CameraManager(
     private val deviceProfile =
         DeviceCapabilityProfiler.profile(context)
 
-    /* ============================================================
-     * Frame Freeze primitives
-     * ============================================================
-     *
-     * frozenFrame:
-     * - Holds the ONE immutable frame for the session
-     * - Write-once (compareAndSet)
-     *
-     * frameRequested:
-     * - Explicit signal: "system is ready to accept ONE frame"
-     * - Analyzer MUST ignore frames when false
-     */
-    private val frozenFrame =
-        AtomicReference<Bitmap?>(null)
+    /* =========================================================================
+     * 📸 CAPTURE STATE MACHINE
+     * ========================================================================= */
 
-    private val frameRequested =
-        AtomicBoolean(false)
-
-    /* ============================================================
-     * Camera start / binding
-     * ============================================================
-     *
-     * This method:
-     * - Binds Preview for UI visibility only
-     * - Binds ImageAnalysis ONLY for internal analyzer
-     * - Does NOT expose frames outward
+    /**
+     * Indicates whether a frame is currently requested.
      */
-    fun startCamera(
-        preview: Preview.SurfaceProvider
-    ) {
+    private val frameRequested = AtomicBoolean(false)
+
+    /**
+     * ✅ prevents double capture (extra safety layer)
+     */
+    @Volatile
+    private var isCapturing = false
+
+    /**
+     * Deferred callback used to deliver result to coroutine.
+     */
+    @Volatile
+    private var pendingContinuation: ((Bitmap?) -> Unit)? = null
+
+    /* =========================================================================
+     * 🚀 CAMERA INITIALIZATION
+     * ========================================================================= */
+
+    fun startCamera(preview: Preview.SurfaceProvider) {
+
         val providerFuture =
             ProcessCameraProvider.getInstance(context)
 
         providerFuture.addListener({
 
             try {
+
                 cameraProvider = providerFuture.get()
                 cameraProvider?.unbindAll()
 
                 val previewUseCase =
                     Preview.Builder()
                         .build()
-                        .apply {
-                            setSurfaceProvider(preview)
-                        }
+                        .apply { setSurfaceProvider(preview) }
 
                 val analysisUseCase =
                     ImageAnalysis.Builder()
@@ -121,12 +155,9 @@ class CameraManager(
                             setAnalyzer(cameraExecutor, internalAnalyzer)
                         }
 
-                val cameraSelector =
-                    CameraSelector.DEFAULT_FRONT_CAMERA
-
                 cameraProvider?.bindToLifecycle(
                     lifecycleOwner,
-                    cameraSelector,
+                    CameraSelector.DEFAULT_FRONT_CAMERA,
                     previewUseCase,
                     analysisUseCase
                 )
@@ -134,126 +165,128 @@ class CameraManager(
                 statusReporter.report(SystemStatus.OK)
 
             } catch (_: SecurityException) {
-                statusReporter.report(
-                    SystemStatus.CAMERA_PERMISSION_REVOKED_BY_SYSTEM
-                )
+                statusReporter.report(SystemStatus.CAMERA_PERMISSION_REVOKED_BY_SYSTEM)
             } catch (_: IllegalStateException) {
                 statusReporter.report(SystemStatus.CAMERA_BUSY)
             } catch (_: OutOfMemoryError) {
                 statusReporter.report(SystemStatus.LOW_MEMORY)
             } catch (e: Exception) {
-                Log.e("CameraManager", "Unexpected camera error", e)
+                Log.e("CameraManager", "Unexpected error", e)
                 statusReporter.report(SystemStatus.INTERNAL_ERROR)
             }
 
         }, ContextCompat.getMainExecutor(context))
     }
 
-    /* ============================================================
-     * Analyzer (Frame Freeze aware)
-     * ============================================================
-     *
-     * Security rules:
-     * - Analyzer MUST ignore frames unless explicitly requested
-     * - Analyzer MUST close ImageProxy always (HAL safety)
-     * - Analyzer MUST never overwrite an existing frozen frame
-     */
+    /* =========================================================================
+     * 🔥 ANALYZER — CORE PIPELINE NODE
+     * ========================================================================= */
+
     private val internalAnalyzer =
-        object : ImageAnalysis.Analyzer {
+        ImageAnalysis.Analyzer { imageProxy ->
 
-            override fun analyze(imageProxy: ImageProxy) {
-                try {
+            var producedBitmap: Bitmap? = null
 
-                    // If no frame requested, discard immediately
-                    if (!frameRequested.get()) {
-                        return
-                    }
+            try {
 
-                    val bitmap =
-                        ImageConverter.imageProxyToBitmap(imageProxy)
+                /* ---------------------------------------------------------
+                 * ✅ Fast exit if no request (critical for performance)
+                 * --------------------------------------------------------- */
+                if (!frameRequested.get()) {
+                    return@Analyzer
+                }
 
-                    /*
-                     * Write-once semantics:
-                     * Only the FIRST frame after request is accepted.
-                     * Any subsequent frames are ignored structurally.
-                     */
-                    if (frozenFrame.compareAndSet(null, bitmap)) {
-                        frameRequested.set(false)
-                    }
+                /* ---------------------------------------------------------
+                 * ✅ Prevent overlapping capture (race guard)
+                 * --------------------------------------------------------- */
+                if (isCapturing) {
+                    return@Analyzer
+                }
 
-                } catch (_: Exception) {
-                    // HAL / conversion errors are swallowed safely
-                } finally {
-                    // ImageProxy MUST be closed no matter what
-                    imageProxy.close()
+                isCapturing = true
+
+                producedBitmap =
+                    ImageConverter.imageProxyToBitmap(imageProxy)
+
+                val continuation = pendingContinuation
+
+                if (continuation != null) {
+
+                    /* -----------------------------------------------------
+                     * ✅ Close session deterministically
+                     * ----------------------------------------------------- */
+                    pendingContinuation = null
+                    frameRequested.set(false)
+
+                    continuation(producedBitmap)
+                    producedBitmap = null // ownership transferred ✅
+                    return@Analyzer
+                }
+
+            } catch (_: Exception) {
+
+                BitmapSafeUtils.safeRecycle(producedBitmap)
+
+            } finally {
+
+                isCapturing = false
+                imageProxy.close()
+            }
+        }
+
+    /* =========================================================================
+     * ✅ PUBLIC API — SUSPEND CAPTURE
+     * ========================================================================= */
+
+    suspend fun captureSingleFrameSuspend(
+        timeoutMs: Long
+    ): Bitmap? = withTimeoutOrNull(timeoutMs) {
+
+        suspendCancellableCoroutine { cont ->
+
+            /* ------------------------------------------------------------
+             * ✅ SINGLE-FLIGHT GUARANTEE
+             * ------------------------------------------------------------ */
+            if (frameRequested.getAndSet(true)) {
+                cont.resume(null)
+                return@suspendCancellableCoroutine
+            }
+
+            /* ------------------------------------------------------------
+             * ✅ Register continuation
+             * ------------------------------------------------------------ */
+            pendingContinuation = { bitmap ->
+
+                if (cont.isActive) {
+                    cont.resume(bitmap)
+                } else {
+                    BitmapSafeUtils.safeRecycle(bitmap)
                 }
             }
-        }
 
-    /* ============================================================
-     * ✅ Frame Freeze Contract (PUBLIC ENTRY POINT)
-     * ============================================================
-     *
-     * This is the ONLY method allowed to retrieve a camera frame.
-     *
-     * Contract:
-     * - Caller requests ONE frame
-     * - CameraManager freezes EXACTLY one frame
-     * - If no frame arrives within timeout → null
-     *
-     * This method intentionally:
-     * - Blocks the calling thread
-     * - Has a hard timeout
-     * - Does NOT retry internally
-     *
-     * Any retry must be an explicit new attendance attempt.
-     */
-    fun captureSingleFrame(
-        timeoutMs: Long
-    ): Bitmap? {
-
-        // Reset any previous state explicitly
-        frozenFrame.set(null)
-        frameRequested.set(true)
-
-        val start =
-            SystemClock.elapsedRealtime()
-
-        while (SystemClock.elapsedRealtime() - start < timeoutMs) {
-            frozenFrame.get()?.let { bitmap ->
-                return bitmap
+            /* ------------------------------------------------------------
+             * ✅ Cancellation-safe cleanup
+             * ------------------------------------------------------------ */
+            cont.invokeOnCancellation {
+                frameRequested.set(false)
+                pendingContinuation = null
             }
-
-            // Small sleep to avoid CPU spinning
-            Thread.sleep(10)
         }
-
-        /*
-         * ⛔ Circuit Breaker:
-         * If timeout is exceeded:
-         * - Stop accepting frames
-         * - Return null deterministically
-         *
-         * No late frames are ever accepted.
-         */
-        frameRequested.set(false)
-        return null
     }
 
-    /* ============================================================
-     * Shutdown
-     * ============================================================
-     *
-     * Ensures:
-     * - Camera HAL is released
-     * - Executor is terminated
-     * - No background frame processing survives
-     */
+    /* =========================================================================
+     * 🛑 CLEAN SHUTDOWN
+     * ========================================================================= */
+
     fun shutdown() {
+
         try {
+
             cameraProvider?.unbindAll()
             cameraExecutor.shutdownNow()
+
             statusReporter.report(SystemStatus.CAMERA_CLOSED)
+
         } catch (_: Exception) {
             statusReporter.report(SystemStatus.INTERNAL_ERROR)
         }

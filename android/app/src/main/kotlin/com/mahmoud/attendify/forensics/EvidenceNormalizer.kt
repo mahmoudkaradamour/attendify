@@ -3,106 +3,72 @@ package com.mahmoud.attendify.forensics
 import android.util.Base64
 import com.mahmoud.attendify.attendance.domain.AttendanceResult
 import com.mahmoud.attendify.orchestration.context.SignedPhysicalRealitySnapshot
+import com.mahmoud.attendify.security.HardwareBackedSnapshotSigner
+import com.mahmoud.attendify.security.attestation.AttestationVerifier
+import com.mahmoud.attendify.security.attestation.AttestationResult
 
 /**
- * ============================================================================
- * EvidenceNormalizer
- * ============================================================================
+ * =============================================================================
+ * 🛡 EvidenceNormalizer — FINAL (A2 + B1 + B2 + D2)
+ * =============================================================================
  *
- * ROLE:
- * ----------------------------------------------------------------------------
- * EvidenceNormalizer is responsible for transforming execution‑time artifacts
- * (which may contain sensitive, raw, or high‑risk data) into a **minimal,
- * privacy‑safe, and legally defensible forensic representation**.
+ * -----------------------------------------------------------------------------
+ * 🧠 ROLE (CRITICAL LAYER)
+ * -----------------------------------------------------------------------------
  *
- * This class is a core component of:
- *   - Phase 3.5 — Evidence Normalization & Redaction
- *   - Phase 3.6 — Hardware‑Backed Attestation Consumption
+ * This class is the ONLY allowed transformation point between:
  *
- * ============================================================================
- * WHY THIS CLASS EXISTS
- * ============================================================================
+ *   Runtime Execution (unsafe / high-risk data)
+ *                     ↓
+ *   ✅ Forensic Evidence (safe / minimal / permanent)
  *
- * Raw execution artifacts (images, locations, biometric signals, timestamps)
- * are:
- *   ❌ Dangerous to store long‑term
- *   ❌ High risk from a privacy perspective
- *   ❌ Often unnecessary for legal or audit purposes
+ * -----------------------------------------------------------------------------
+ * 🔐 SECURITY MODEL
+ * -----------------------------------------------------------------------------
  *
- * Therefore:
- *   ➤ We **normalize** evidence
- *   ➤ We **redact** sensitive details
- *   ➤ We **retain only what is strictly necessary** to prove the event
+ * ✅ Removes:
+ *   - Raw images
+ *   - Biometric embeddings
+ *   - Exact sensor streams
  *
- * This follows well‑established principles from:
- *   - Digital forensics
- *   - Privacy‑by‑Design (GDPR‑style data minimization)
- *   - Audit‑grade logging systems
+ * ✅ Preserves:
+ *   - snapshotHash → 🔥 link to physical reality (A2 + D2)
+ *   - signature → authenticity proof (B1)
+ *   - certificateChain → hardware trust root (B2)
  *
- * ============================================================================
- * WHAT THIS CLASS GUARANTEES
- * ============================================================================
+ * -----------------------------------------------------------------------------
+ * ⚖️ FORENSIC GUARANTEE
+ * -----------------------------------------------------------------------------
  *
- * ✅ No biometric data is persisted
- * ✅ No raw images are persisted
- * ✅ No precise location data is persisted
- * ✅ No sensor‑level data is persisted
+ * After normalization:
  *
- * ✅ Cryptographic attestation is preserved
- * ✅ Administrative meaning is preserved
- * ✅ Chain‑of‑custody remains intact
+ * ✅ Evidence is:
+ *   - Privacy-safe
+ *   - Legally defensible
+ *   - Cryptographically verifiable
  *
- * ============================================================================
- * WHAT THIS CLASS DELIBERATELY DOES NOT DO
- * ============================================================================
+ * ❗ Any modification → breaks hash chain OR signature
  *
- * ❌ It does NOT perform cryptographic signing
- * ❌ It does NOT validate signatures
- * ❌ It does NOT make attendance decisions
- * ❌ It does NOT persist data
- *
- * Its role is **purely transformational and deterministic**.
- *
- * ============================================================================
- * TRUST MODEL
- * ============================================================================
- *
- * This class assumes that:
- *   - SignedPhysicalRealitySnapshot is already trusted & attested
- *   - AttendanceResult is already final and authoritative
- *
- * EvidenceNormalizer does NOT question these inputs.
  */
 object EvidenceNormalizer {
 
     /**
      * =========================================================================
-     * normalize
+     * ✅ NORMALIZE
      * =========================================================================
      *
-     * Transforms a signed snapshot and its final attendance result into
-     * NormalizedForensicEvidence — the ONLY form of evidence permitted for
-     * long‑term forensic storage.
+     * PIPELINE:
      *
-     * ------------------------------------------------------------------------
-     * INPUTS:
-     * ------------------------------------------------------------------------
-     * snapshot :
-     *   - Contains hardware‑backed signature
-     *   - Certificate chain proves key origin (TEE / StrongBox)
+     *   SignedSnapshot
+     *        ↓
+     *   Verify (B1)
+     *        ↓
+     *   Validate Attestation (B2)
+     *        ↓
+     *   Reduce Sensitive Data
+     *        ↓
+     *   Build Minimal Evidence
      *
-     * result :
-     *   - Final administrative decision (ACCEPTED or BLOCKED)
-     *   - Produced exclusively by AttendanceUseCase
-     *
-     * ------------------------------------------------------------------------
-     * OUTPUT:
-     * ------------------------------------------------------------------------
-     * NormalizedForensicEvidence:
-     *   - Minimal
-     *   - Privacy‑safe
-     *   - Audit‑grade
-     *   - Legally defensible
      */
     fun normalize(
         snapshot: SignedPhysicalRealitySnapshot,
@@ -110,71 +76,100 @@ object EvidenceNormalizer {
     ): NormalizedForensicEvidence {
 
         /* ===============================================================
-         * EXTRACT POLICY‑LEVEL MEANING
+         * 🔐 STEP 1 — VERIFY SIGNATURE (B1)
          * ===============================================================
          *
-         * IMPORTANT DESIGN DECISION:
-         * ----------------------------------------------------------------
-         * • We store the ACTION only for ACCEPTED cases.
-         * • For BLOCKED cases, action is considered non‑authoritative.
-         *
-         * RATIONALE:
-         * - A successful attendance must be attributable.
-         * - A blocked attempt only requires a reason for rejection.
-         * - This avoids leaking partial or misleading intent data.
+         * Defensive verification:
+         * Even if caller forgot verification, we enforce it here.
          */
-        val (action, decision, decisionReason) =
+        val signatureValid =
+            HardwareBackedSnapshotSigner.verify(
+                snapshot.snapshotHash,
+                snapshot.signature,
+                snapshot.certificateChain
+            )
+
+        if (!signatureValid) {
+            throw IllegalStateException(
+                "Invalid snapshot signature — normalization aborted"
+            )
+        }
+
+        /* ===============================================================
+         * 🔐 STEP 2 — ATTESTATION VALIDATION (B2)
+         * ===============================================================
+         *
+         * Determines:
+         * - StrongBox (highest trust)
+         * - TEE (trusted)
+         * - Weak / unknown
+         */
+        val attestationResult =
+            AttestationVerifier.verify(snapshot.certificateChain)
+
+        if (attestationResult is AttestationResult.Invalid) {
+            throw IllegalStateException(
+                "Invalid hardware attestation — rejected"
+            )
+        }
+
+        val attestationLevel =
+            attestationResult::class.simpleName ?: "UNKNOWN"
+
+        /* ===============================================================
+         * 🧾 STEP 3 — EXTRACT ADMINISTRATIVE MEANING
+         * =============================================================== */
+        val (action, decision, decisionReasonBase) =
             when (result) {
 
                 is AttendanceResult.Accepted ->
                     Triple(
-                        result.action.name, // authoritative
+                        result.action.name,
                         "ACCEPTED",
-                        null                // ✅ no justification persisted
+                        null
                     )
 
                 is AttendanceResult.Blocked ->
                     Triple(
-                        "UNKNOWN",          // non‑authoritative on failure
+                        "UNKNOWN",
                         "BLOCKED",
-                        result.reason       // ✅ essential forensic reason
+                        result.reason
                     )
             }
 
         /* ===============================================================
-         * BUILD NORMALIZED FORENSIC EVIDENCE
+         * ✅ STEP 4 — FORENSIC-AWARE DECISION REASON
          * ===============================================================
          *
-         * Every field below has passed the following test:
+         * We append attestation level for audit traceability.
          *
-         *   "If this field leaks, would it endanger privacy,
-         *    security, or create unnecessary legal exposure?"
-         *
-         * Only fields with a justified forensic purpose survive.
+         * Example:
+         * BLOCKED|face_mismatch|ATTEST=TrustedTEE
          */
+        val decisionReason =
+            decisionReasonBase?.let {
+                "$it|ATTEST=$attestationLevel"
+            } ?: "ATTEST=$attestationLevel"
+
+        /* ===============================================================
+         * ✅ STEP 5 — BUILD FINAL FORENSIC EVIDENCE
+         * =============================================================== */
         return NormalizedForensicEvidence(
 
             /* -----------------------------------------------------------
-             * CORRELATION
-             * -----------------------------------------------------------
-             * Used to correlate this record with:
-             * - Replay protection logs
-             * - Snapshot lifecycle
-             */
+             * 🔗 CORRELATION
+             * ----------------------------------------------------------- */
             snapshotId =
                 snapshot.snapshotId.toString(),
 
             /* -----------------------------------------------------------
-             * TIME (NORMALIZED)
-             * -----------------------------------------------------------
-             * Timestamp reflects WHEN the snapshot was sealed,
-             * not raw sensor time or external clocks.
-             */
+             * 🕒 TIME
+             * ----------------------------------------------------------- */
             timestampMillis =
                 snapshot.timestampMillis,
 
             /* -----------------------------------------------------------
-             * ADMINISTRATIVE MEANING
+             * 🧾 ADMIN MEANING
              * ----------------------------------------------------------- */
             action =
                 action,
@@ -185,22 +180,33 @@ object EvidenceNormalizer {
             decisionReason =
                 decisionReason,
 
-            /* -----------------------------------------------------------
-             * HARDWARE‑BACKED CRYPTOGRAPHIC ATTESTATION
-             * -----------------------------------------------------------
-             * These fields allow a third party to verify that:
-             *   - The snapshot was signed
-             *   - The signing key is hardware‑backed
-             *   - The key cannot be extracted or cloned
+            /* ============================================================
+             * 🔥 D2 — CRYPTOGRAPHIC BINDING TO REALITY
+             * ============================================================
              *
-             * This is stronger than keeping a raw hash.
+             * This is the MOST IMPORTANT FIELD:
+             *
+             * snapshotHash links:
+             *
+             * Ledger ↔ Evidence ↔ Physical Reality
+             *
+             * Without it → system is legally weak
              */
+            snapshotHash =
+                snapshot.snapshotHash,
+
+            /* -----------------------------------------------------------
+             * 🔏 SIGNATURE (AUTHENTICITY)
+             * ----------------------------------------------------------- */
             snapshotSignature =
                 Base64.encodeToString(
                     snapshot.signature,
                     Base64.NO_WRAP
                 ),
 
+            /* -----------------------------------------------------------
+             * 🔗 CERTIFICATE CHAIN (TRUST ROOT)
+             * ----------------------------------------------------------- */
             certificateChain =
                 snapshot.certificateChain.map {
                     Base64.encodeToString(it, Base64.NO_WRAP)

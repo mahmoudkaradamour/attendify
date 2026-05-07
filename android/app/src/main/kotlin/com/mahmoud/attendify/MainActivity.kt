@@ -9,6 +9,7 @@ import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import kotlinx.coroutines.*
 
 /* ============================================================================
  * CAMERA & SYSTEM
@@ -17,13 +18,13 @@ import com.mahmoud.attendify.camera.CameraManager
 import com.mahmoud.attendify.camera.SystemStatusReporter
 
 /* ============================================================================
- * ORCHESTRATION (PIPELINE COORDINATION)
+ * ORCHESTRATION
  * ========================================================================== */
 import com.mahmoud.attendify.orchestration.AttendanceRuntimeOrchestrator
 import com.mahmoud.attendify.orchestration.PhysicalRealityBuilder
 
 /* ============================================================================
- * DOMAIN (FINAL DECISION AUTHORITY)
+ * DOMAIN
  * ========================================================================== */
 import com.mahmoud.attendify.attendance.usecase.AttendanceUseCase
 
@@ -32,165 +33,211 @@ import com.mahmoud.attendify.attendance.usecase.AttendanceUseCase
  * ========================================================================== */
 import com.mahmoud.attendify.face.FaceDetector
 import com.mahmoud.attendify.face.MobileFaceNet
-
 import com.mahmoud.attendify.matching.FaceMatchingOrchestrator
 import com.mahmoud.attendify.repository.local.LocalEncryptedEmployeeReferenceRepository
 import com.mahmoud.attendify.policy.MatchingPolicy
 import com.mahmoud.attendify.policy.ReferenceAccessPolicy
 import com.mahmoud.attendify.policy.ReferenceValidationPolicy
-
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
 
 /* ============================================================================
- * TIME, LOCATION, WORKING HOURS
+ * TIME & LOCATION
  * ========================================================================== */
 import com.mahmoud.attendify.system.time.*
 import com.mahmoud.attendify.system.location.*
 import com.mahmoud.attendify.system.time.working.*
 
 /* ============================================================================
- * CONFIG & CHANNEL
+ * FORENSICS
+ * ========================================================================== */
+import com.mahmoud.attendify.forensics.*
+import com.mahmoud.attendify.forensics.repository.ForensicAuditRepository
+import com.mahmoud.attendify.forensics.db.*
+
+/* ============================================================================
+ * SECURITY
+ * ========================================================================== */
+import com.mahmoud.attendify.security.ReplayProtectionGuard
+import com.mahmoud.attendify.security.legal.LegalEvidenceWriter
+
+/* ============================================================================
+ * RECOVERY
+ * ========================================================================== */
+import com.mahmoud.attendify.storage.recovery.AttemptRecoveryManager
+
+/* ============================================================================
+ * CONFIG + CHANNEL
  * ========================================================================== */
 import com.mahmoud.attendify.attendance.config.AttendancePolicyProvider
 import com.mahmoud.attendify.channel.AttendanceMethodChannel
-import com.mahmoud.attendify.forensics.ForensicAuditTrailWriter
 
 /**
- * ============================================================================
- * MainActivity  —  ANDROID COMPOSITION ROOT
- * ============================================================================
+ * =============================================================================
+ * 🛡 MainActivity — System Composition Root (Deterministic Assembly Layer)
+ * =============================================================================
  *
- * ROLE (EXTREMELY RESTRICTED):
- * ---------------------------------------------------------------------------
- * This Activity is:
- *  ✅ Android entry point
- *  ✅ Dependency Composition Root
- *  ✅ Camera PREVIEW host only
+ * -----------------------------------------------------------------------------
+ * 🧠 ROLE (ARCHITECTURAL)
+ * -----------------------------------------------------------------------------
  *
- * This Activity is NOT:
- *  ❌ A decision maker
- *  ❌ A biometric processor
- *  ❌ A holder of security authority
+ * This class represents the **Composition Root** of the system.
  *
- * ============================================================================
- * TRUST MODEL
- * ============================================================================
- * MainActivity is considered **UNTRUSTED** by design.
+ * It is responsible for:
  *
- * Any compromise of this class MUST NOT:
- *  - Influence attendance decisions
- *  - Alter biometric evidence
- *  - Bypass atomic reality capture
+ *   ✔ Dependency Graph Construction
+ *   ✔ System Initialization (Bootstrapping)
+ *   ✔ Wiring execution pipeline
  *
- * ============================================================================
- * ARCHITECTURAL OVERVIEW
- * ============================================================================
+ * It MUST NOT contain:
  *
- *   ┌───────────────────────────────┐
- *   │        Flutter UI             │  UNTRUSTED
- *   └──────────────┬────────────────┘
- *                  │ MethodChannel (intent only)
- *   ┌──────────────▼────────────────┐
- *   │        MainActivity            │  COMPOSITION ROOT
- *   │  - wires dependencies          │
- *   │  - hosts camera preview        │
- *   └──────────────┬────────────────┘
- *                  │ fully‑wired runtime
- *   ┌──────────────▼────────────────┐
- *   │ AttendanceRuntimeOrchestrator │  TRUSTED PIPELINE
- *   └──────────────┬────────────────┘
- *                  │ AtomicContext
- *   ┌──────────────▼────────────────┐
- *   │     AttendanceUseCase          │  FINAL AUTHORITY
- *   └───────────────────────────────┘
+ *   ✖ Business logic
+ *   ✖ Security decisions
+ *   ✖ Biometric processing
  *
- * ============================================================================
- * POST‑PHASE‑3.2 GUARANTEE (AFTER TOCTOU DEFUSING)
- * ============================================================================
+ * -----------------------------------------------------------------------------
+ * 🧠 TRUST MODEL
+ * -----------------------------------------------------------------------------
  *
- * ✅ MainActivity NEVER:
- *    - captures frames
- *    - reads time
- *    - evaluates location
+ *   UI Layer (Flutter) → UNTRUSTED INPUT
+ *   MainActivity        → CONFIGURATION ONLY
+ *   Orchestrator        → TRUST AUTHORITY
  *
- * ✅ All physical reality is captured atomically inside:
- *    PhysicalRealityBuilder
+ * -----------------------------------------------------------------------------
+ * 📊 SYSTEM STARTUP FLOW
+ * -----------------------------------------------------------------------------
+ *
+ *   App Launch
+ *       │
+ *       ▼
+ *   Initialize global context
+ *       │
+ *       ▼
+ *   Initialize security guards
+ *       │
+ *       ▼
+ *   Load persistent forensic ledger
+ *       │
+ *       ▼
+ *   Verify chain integrity
+ *       │
+ *       ▼
+ *   Build full runtime pipeline
+ *       │
+ *       ▼
+ *   Run recovery checks
+ *       │
+ *       ▼
+ *   Start camera preview
+ *
+ * -----------------------------------------------------------------------------
+ * 🔐 SECURITY GUARANTEES
+ * -----------------------------------------------------------------------------
+ *
+ * ✅ Replay protection initialized before any action
+ * ✅ Persistent ledger verified on startup
+ * ✅ Abnormal shutdowns detected (recovery layer)
+ * ✅ Dependency graph cannot be altered at runtime
+ *
  */
 class MainActivity : FlutterActivity() {
 
-    /* =========================================================================
-     * UI COMPONENTS
-     * ======================================================================= */
-
-    /**
-     * Camera preview surface.
-     *
-     * IMPORTANT DISTINCTION:
-     * ----------------------
-     * Preview is VISUAL FEEDBACK only.
-     * It has ZERO access to frames used in attendance.
-     */
     private lateinit var previewView: PreviewView
-
-    /* =========================================================================
-     * CORE RUNTIME COMPONENTS
-     * ======================================================================= */
-
     private lateinit var cameraManager: CameraManager
     private lateinit var orchestrator: AttendanceRuntimeOrchestrator
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        /* ---------------------------------------------------------------------
-         * UI INITIALIZATION
-         * ------------------------------------------------------------------ */
+        /* ================================================================
+         * 🧠 GLOBAL CONTEXT INITIALIZATION
+         * ================================================================ */
+        com.mahmoud.attendify.app.AppContextProvider
+            .initialize(applicationContext)
+
+        /* ================================================================
+         * 🔐 REPLAY PROTECTION (EARLY INIT)
+         * ================================================================ */
+        ReplayProtectionGuard.initialize {
+            applicationContext
+        }
+
+        /* ================================================================
+         * 🎥 UI LAYER (STRICTLY PASSIVE)
+         * ================================================================ */
         previewView = PreviewView(this)
         setContentView(previewView)
 
-        /* ---------------------------------------------------------------------
-         * CAMERA MANAGER
-         *
-         * Owns:
-         *  - Camera lifecycle
-         *  - Hardware access
-         *
-         * Does NOT:
-         *  - Decide when frames are frozen
-         *  - Decide attendance logic
-         * ------------------------------------------------------------------ */
+        /* ================================================================
+         * 📸 CAMERA LAYER (HARDWARE ACCESS ONLY)
+         * ================================================================ */
         cameraManager = CameraManager(
             context = this,
             lifecycleOwner = this,
-            statusReporter = SystemStatusReporter {
-                // Optional non‑authoritative UI feedback
-            }
+            statusReporter = SystemStatusReporter {}
         )
 
-        /* ---------------------------------------------------------------------
-         * COMPOSITION ROOT
-         * ------------------------------------------------------------------ */
-        orchestrator = buildAttendanceRuntime(cameraManager)
+        /* ================================================================
+         * 🗄 PERSISTENT FORENSIC LEDGER (D1)
+         * ================================================================ */
+        val db = androidx.room.Room.databaseBuilder(
+            applicationContext,
+            ForensicDatabase::class.java,
+            "forensic.db"
+        ).build()
 
-        /* ---------------------------------------------------------------------
-         * PERMISSIONS
-         * ------------------------------------------------------------------ */
+        val repository = ForensicAuditRepository(db.auditDao())
+        val auditWriter = ForensicAuditTrailWriter(repository)
+
+        /* ================================================================
+         * 🔐 ANTI-TAMPER CHAIN VERIFICATION (D2)
+         * ================================================================ */
+        CoroutineScope(Dispatchers.IO).launch {
+
+            val valid = repository.verifyChain()
+
+            if (!valid) {
+                auditWriter.appendSystemEvent(
+                    event = "LEDGER_TAMPER_DETECTED",
+                    details = "Forensic chain integrity violation"
+                )
+            }
+        }
+
+        /* ================================================================
+         * 🧾 LEGAL EVIDENCE WRITER (SEPARATE CHANNEL)
+         * ================================================================ */
+        val legalEvidenceWriter = LegalEvidenceWriter()
+
+        /* ================================================================
+         * 🧠 BUILD FULL RUNTIME ENGINE
+         * ================================================================ */
+        orchestrator = buildAttendanceRuntime(
+            cameraManager,
+            auditWriter,
+            legalEvidenceWriter
+        )
+
+        /* ================================================================
+         * 🧯 RECOVERY SYSTEM (ANTI-SILENT-FAILURE)
+         * ================================================================ */
+        val recoveryManager = AttemptRecoveryManager(
+            lifecycleManager = orchestrator.lifecycleManager,
+            auditWriter = auditWriter
+        )
+
+        CoroutineScope(Dispatchers.IO).launch {
+            recoveryManager.runRecoveryCheck()
+        }
+
+        /* ================================================================
+         * 🔑 PERMISSIONS
+         * ================================================================ */
         checkCameraPermissionAndStart()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        /* ---------------------------------------------------------------------
-         * FLUTTER ↔ NATIVE BRIDGE
-         *
-         * SECURITY CONTRACT:
-         * Flutter may send INTENT only.
-         * Flutter NEVER supplies:
-         *  - Identity
-         *  - Evidence
-         *  - Flags
-         * ------------------------------------------------------------------ */
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "attendance_channel"
@@ -198,10 +245,6 @@ class MainActivity : FlutterActivity() {
             AttendanceMethodChannel(orchestrator)
         )
     }
-
-    /* =========================================================================
-     * CAMERA PERMISSION FLOW
-     * ======================================================================= */
 
     private fun checkCameraPermissionAndStart() {
         if (
@@ -221,9 +264,7 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * Starts CAMERA PREVIEW ONLY.
-     *
-     * Frame capture for attendance is strictly controlled elsewhere.
+     * Camera preview ONLY — no capture logic allowed here
      */
     private fun startCameraPreview() {
         cameraManager.startCamera(
@@ -232,40 +273,18 @@ class MainActivity : FlutterActivity() {
     }
 
     /* =========================================================================
-     * COMPOSITION ROOT IMPLEMENTATION
-     * ======================================================================= */
+     * 🧠 COMPOSITION ROOT — FULL DEPENDENCY GRAPH
+     * ========================================================================= */
 
-    /**
-     * Builds the complete attendance runtime.
-     *
-     * SCIENTIFIC / ARCHITECTURAL RATIONALE:
-     * ------------------------------------
-     * - All dependencies are explicit
-     * - No hidden globals
-     * - Auditable construction
-     * - Reproducible pipeline
-     */
     private fun buildAttendanceRuntime(
-        cameraManager: CameraManager
+        cameraManager: CameraManager,
+        auditWriter: ForensicAuditTrailWriter,
+        legalEvidenceWriter: LegalEvidenceWriter
     ): AttendanceRuntimeOrchestrator {
 
-        /* ---------------- FACE & EMBEDDINGS ---------------- */
+        /* ---------------- BIOMETRICS ---------------- */
         val faceDetector = FaceDetector(this)
         val faceNet = MobileFaceNet(this)
-
-        /* ---------------- LOCATION INTEGRITY ---------------- */
-        val locationIntegrityGuard =
-            LocationIntegrityGuard(
-                context = this,
-                policy = AttendancePolicyProvider.locationPolicy(),
-                zonesPolicy = null, // explicit Phase‑1 decision
-                locationSource = LocationSource(this),
-                anchorStorage = SecureLocationAnchorStorage(this)
-            )
-
-        /* ---------------- FACE MATCHING (SINGLE AUTHORITY) --- */
-        val referenceRepository =
-            LocalEncryptedEmployeeReferenceRepository(this)
 
         val faceMatchingOrchestrator =
             FaceMatchingOrchestrator(
@@ -275,10 +294,21 @@ class MainActivity : FlutterActivity() {
                         ReferenceValidationPolicy.NEVER_VALIDATE_AT_ATTENDANCE
                 ),
                 referenceAccessPolicy = ReferenceAccessPolicy.LOCAL_ONLY,
-                repository = referenceRepository
+                repository =
+                    LocalEncryptedEmployeeReferenceRepository(this)
             )
 
-        /* ---------------- FINAL DECISION AUTHORITY ----------- */
+        /* ---------------- LOCATION ---------------- */
+        val locationIntegrityGuard =
+            LocationIntegrityGuard(
+                context = this,
+                policy = AttendancePolicyProvider.locationPolicy(),
+                zonesPolicy = null,
+                locationSource = LocationSource(this),
+                anchorStorage = SecureLocationAnchorStorage(this)
+            )
+
+        /* ---------------- DOMAIN ---------------- */
         val attendanceUseCase =
             AttendanceUseCase(
                 timeIntegrityGuard =
@@ -302,30 +332,30 @@ class MainActivity : FlutterActivity() {
                     )
             )
 
-        /* ---------------- ATOMIC REALITY BUILDER ------------- */
+        /* ---------------- REALITY BUILDER ---------------- */
         val physicalRealityBuilder =
             PhysicalRealityBuilder(
                 cameraManager = cameraManager,
                 locationIntegrityGuard = locationIntegrityGuard
             )
 
-        /* ---------------- RUNTIME ORCHESTRATOR --------------- */
+        /* ---------------- LIFECYCLE ---------------- */
+        val lifecycleManager =
+            com.mahmoud.attendify.attendance.lifecycle
+                .AttemptLifecycleManager(applicationContext)
 
-
-        /* ---------------- FORENSIC AUDIT TRAIL (PHASE 3.4 + 3.5) -------- */
-        val forensicAuditTrailWriter =
-            ForensicAuditTrailWriter()
-
+        /* ---------------- ORCHESTRATOR ---------------- */
         return AttendanceRuntimeOrchestrator(
             physicalRealityBuilder = physicalRealityBuilder,
             faceDetector = faceDetector,
             faceNet = faceNet,
-            livenessOrchestrator = null, // Phase‑1 disabled by policy
+            livenessOrchestrator = null,
             facialMetricsEngine = FacialMetricsEngine(),
             faceMatchingOrchestrator = faceMatchingOrchestrator,
             attendanceUseCase = attendanceUseCase,
-            auditTrailWriter = forensicAuditTrailWriter
+            auditTrailWriter = auditWriter,
+            legalEvidenceWriter = legalEvidenceWriter,
+            lifecycleManager = lifecycleManager
         )
-
     }
 }

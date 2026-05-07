@@ -1,6 +1,10 @@
 plugins {
     id("com.android.application")
     id("kotlin-android")
+
+    // ✅ Required for Room (annotation processing)
+    id("kotlin-kapt")
+
     // Flutter Gradle Plugin must be applied last
     id("dev.flutter.flutter-gradle-plugin")
 }
@@ -9,24 +13,19 @@ android {
 
     /*
      * Namespace:
-     * - Used internally by Android for R, BuildConfig, MainActivity
-     * - Must match your Kotlin package structure
-     * - Do NOT change later
+     * Must match project package
      */
     namespace = "com.mahmoud.attendify"
 
     /*
-     * Compile SDK:
-     * - Taken from Flutter
-     * - Usually the latest stable Android SDK
+     * Compile SDK
      */
     compileSdk = flutter.compileSdkVersion
 
     ndkVersion = flutter.ndkVersion
 
     /*
-     * Java / Kotlin compatibility
-     * Java 17 is recommended for modern Android
+     * Java / Kotlin
      */
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -39,91 +38,80 @@ android {
 
     defaultConfig {
 
-        /*
-         * Application ID:
-         * - This is the permanent identity of the app on Android
-         * - Used internally by the OS and Play Store
-         * - Suitable for GitHub and personal open‑source projects
-         */
         applicationId = "com.mahmoud.attendify"
 
-        /*
-         * Minimum supported Android version
-         * Android 9 (Pie) = API 28
-         * Good balance between stability and device coverage
-         */
         minSdk = 28
-
-        /*
-         * Target SDK:
-         * - Latest behavior expected by Android
-         */
         targetSdk = flutter.targetSdkVersion
 
-        /*
-         * Versioning comes from Flutter
-         */
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-        /*
-         * Important for large / enterprise apps
-         * (biometric, services, crypto, networking, etc.)
-         */
         multiDexEnabled = true
     }
 
     buildTypes {
         release {
-            /*
-             * Debug signing is acceptable during development
-             * Replace with a release keystore later when publishing
-             */
             signingConfig = signingConfigs.getByName("debug")
         }
+    }
+}
+
+/* ========================================================================
+ * ✅ KAPT CONFIG (Stable version)
+ * ====================================================================== */
+kapt {
+    arguments {
+        arg("correctErrorTypes", "true")
     }
 }
 
 flutter {
     source = "../.."
 }
+
 dependencies {
 
-    implementation("androidx.appcompat:appcompat:1.6.1")
+    /* =========================================================
+     * ✅ Core Android
+     * ========================================================= */
+    implementation("androidx.appcompat:appcompat:1.7.1")
 
     /* =========================================================
-     * TensorFlow Lite (Core + GPU)
+     * ✅ Room Database (D1 — Persistent Ledger)
      * ========================================================= */
+    implementation("androidx.room:room-runtime:2.8.4")
+    implementation("androidx.room:room-ktx:2.8.4")
 
-    // ✅ TensorFlow Lite Core (الأساس)
-    implementation("org.tensorflow:tensorflow-lite:2.14.0")
-
-    // ✅ TensorFlow Lite GPU Delegate (اختياري – سنستخدمه بسياسة)
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
-
-    // ✅ TensorFlow Lite Support (مفيد للـ utils والـ metadata)
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
-
+    // Annotation processor (stable)
+    kapt("androidx.room:room-compiler:2.8.4")
 
     /* =========================================================
-     * CameraX
+     * ✅ TensorFlow Lite (FIXED ALIGNMENT ISSUE)
      * ========================================================= */
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-support:0.5.0")
 
+    /* =========================================================
+     * ✅ CameraX (STABLE — DO NOT UPDATE NOW)
+     * ========================================================= */
     implementation("androidx.camera:camera-core:1.3.2")
     implementation("androidx.camera:camera-camera2:1.3.2")
     implementation("androidx.camera:camera-lifecycle:1.3.2")
     implementation("androidx.camera:camera-view:1.3.2")
 
+    /* =========================================================
+     * ✅ Security (Stable Release)
+     * ========================================================= */
+    implementation("androidx.security:security-crypto:1.1.0")
 
     /* =========================================================
-     * Security
+     * ✅ Networking (STABLE VERSION)
      * ========================================================= */
-
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
-
-    // Networking (Server Time Handshake)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // JSON parsing
+    /* =========================================================
+     * ✅ JSON
+     * ========================================================= */
     implementation("org.json:json:20231013")
 }

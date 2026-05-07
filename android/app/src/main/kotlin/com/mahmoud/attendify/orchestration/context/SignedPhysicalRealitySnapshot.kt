@@ -14,6 +14,8 @@ data class SignedPhysicalRealitySnapshot(
 
     /* Phase 3.6 additions */
     val signature: ByteArray,
-    val certificateChain: List<ByteArray>
+    val certificateChain: List<ByteArray>,
+    // Deterministic hash of the canonical payload that was signed
+    val snapshotHash: ByteArray
 
 )

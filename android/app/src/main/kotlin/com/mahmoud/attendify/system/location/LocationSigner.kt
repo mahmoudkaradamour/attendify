@@ -18,11 +18,21 @@ object LocationSigner {
     private const val KEY_ALIAS = "location_evidence_key"
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
 
-    fun sign(data: String): String {
+    /**
+     * ✅ NEW — SIGN BYTE ARRAY (CORRECT)
+     */
+    fun sign(data: ByteArray): String {
         val signature = Signature.getInstance("SHA256withRSA")
         signature.initSign(getPrivateKey())
-        signature.update(data.toByteArray())
+        signature.update(data)
         return Base64.getEncoder().encodeToString(signature.sign())
+    }
+
+    /**
+     * ✅ LEGACY SUPPORT (optional but useful)
+     */
+    fun sign(data: String): String {
+        return sign(data.toByteArray(Charsets.UTF_8))
     }
 
     private fun getPrivateKey(): PrivateKey {

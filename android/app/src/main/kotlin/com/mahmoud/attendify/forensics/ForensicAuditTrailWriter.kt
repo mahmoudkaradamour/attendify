@@ -1,195 +1,214 @@
 package com.mahmoud.attendify.forensics
 
+import android.util.Base64
+import com.mahmoud.attendify.forensics.repository.ForensicAuditRepository
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * ============================================================================
- * ForensicAuditTrailWriter
- * ============================================================================
+ * =============================================================================
+ * 🛡 ForensicAuditTrailWriter — FINAL STABLE VERSION
+ * =============================================================================
  *
- * ROLE:
- * ----------------------------------------------------------------------------
- * This class is responsible for maintaining the system's
- * **persistent forensic audit trail**.
+ * ┌──────────────────────────── FLOW ─────────────────────────────┐
  *
- * It represents the LAST step in the attendance pipeline,
- * executed ONLY AFTER a final AttendanceResult is produced.
+ *  Orchestrator
+ *      │
+ *      ▼
+ *  append()
+ *      │
+ *      ▼
+ *  Hash Chain (Integrity)
+ *      │
+ *      ▼
+ *  Repository → Room DB (D1)
  *
- * ============================================================================
- * CORE PRINCIPLES
- * ============================================================================
+ * └───────────────────────────────────────────────────────────────┘
  *
- * 1. APPEND‑ONLY
- *    ------------------------------------------------------------------------
- *    - Records can ONLY be added.
- *    - No record can be modified or deleted.
+ * -----------------------------------------------------------------------------
+ * ✅ WHAT THIS CLASS GUARANTEES
+ * -----------------------------------------------------------------------------
  *
- * 2. ORDERED
- *    ------------------------------------------------------------------------
- *    - Every record has a strictly increasing index.
- *    - Preserves chronological integrity.
+ * ✅ Append-only forensic ledger
+ * ✅ Hash-chain integrity
+ * ✅ Binding ledger → real-world evidence (snapshotHash)
+ * ✅ Crash-safe chain continuity
  *
- * 3. TAMPER‑EVIDENT
- *    ------------------------------------------------------------------------
- *    - Each record is cryptographically linked (hash‑chained)
- *      to the previous record.
- *    - Any deletion or modification breaks the chain.
- *
- * 4. PRIVACY‑SAFE (POST PHASE 3.5)
- *    ------------------------------------------------------------------------
- *    - Only NormalizedForensicEvidence is persisted.
- *    - No biometric data.
- *    - No raw images.
- *    - No precise location data.
- *
- * ============================================================================
- * WHAT THIS CLASS DOES NOT DO
- * ============================================================================
- *
- * ❌ Does not make attendance decisions
- * ❌ Does not handle biometric processing
- * ❌ Does not normalize evidence
- * ❌ Does not expose stored records
- *
- * Its responsibility is purely **forensic persistence**.
- *
- * ============================================================================
- * HIGH‑LEVEL LEDGER MODEL
- * ============================================================================
- *
- *  NormalizedForensicEvidence
- *              │
- *              ▼
- *     ForensicAuditRecord
- *              │
- *              ▼
- *   Hash‑Chained Append‑Only Ledger
- *
- * ============================================================================
- * LEGAL / AUDIT JUSTIFICATION
- * ============================================================================
- *
- * This implementation aligns with:
- *  - Chain of Custody principles
- *  - Audit‑grade logging practices
- *  - Privacy‑by‑Design (GDPR‑style minimization)
- *
- * It intentionally resembles blockchain‑style ledgers
- * (WITHOUT networking or consensus complexity).
  */
-class ForensicAuditTrailWriter {
+class ForensicAuditTrailWriter(
 
-    /**
-     * Monotonic index counter.
-     *
-     * SCIENTIFIC JUSTIFICATION:
-     * ------------------------------------------------------------------------
-     * - Guarantees strict ordering of events
-     * - Prevents insertion between records
-     * - Simplifies forensic timeline reconstruction
-     */
+    private val repository: ForensicAuditRepository? = null
+
+) {
+
+    /* =========================================================================
+     * ✅ CORE STATE
+     * ========================================================================= */
+
     private val indexCounter = AtomicLong(0)
 
-    /**
-     * Hash of the previous audit record.
-     *
-     * GENESIS STATE:
-     * ------------------------------------------------------------------------
-     * - Initialized to a zero‑filled byte array
-     * - Acts as the "genesis block" anchor
-     */
     private var lastHash: ByteArray = ByteArray(32)
 
-    /**
-     * =========================================================================
-     * append
-     * =========================================================================
-     *
-     * Appends a NEW forensic audit record to the ledger.
-     *
-     * INPUT:
-     * ------------------------------------------------------------------------
-     * evidence → Normalized, privacy‑safe forensic evidence
-     *
-     * GUARANTEES:
-     * ------------------------------------------------------------------------
-     * ✅ No mutation of input data
-     * ✅ One‑way append
-     * ✅ Hash‑chained integrity
-     *
-     * NOTE ON PERSISTENCE:
-     * ------------------------------------------------------------------------
-     * This implementation is storage‑agnostic.
-     * The record can later be persisted to:
-     *  - Encrypted file
-     *  - Room database
-     *  - Secure hardware‑backed storage
-     *
-     * WITHOUT changing this API.
-     */
-    fun append(
+    /* =========================================================================
+     * ✅ SECURE STATE PERSISTENCE (CHAIN ONLY)
+     * ========================================================================= */
+
+    @Suppress("DEPRECATION")
+    private val prefs by lazy {
+        try {
+            val ctx = com.mahmoud.attendify.app.AppContextProvider.context()
+
+            androidx.security.crypto.EncryptedSharedPreferences.create(
+                ctx,
+                "forensic_ledger_state",
+                androidx.security.crypto.MasterKey.Builder(ctx)
+                    .setKeyScheme(androidx.security.crypto.MasterKey.KeyScheme.AES256_GCM)
+                    .build(),
+                androidx.security.crypto.EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                androidx.security.crypto.EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    init {
+        loadState()
+    }
+
+    private fun loadState() {
+        try {
+            prefs?.getString("lastHash", null)?.let {
+                lastHash = Base64.decode(it, Base64.NO_WRAP)
+            }
+
+            prefs?.getString("indexCounter", null)?.let {
+                indexCounter.set(it.toLong())
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun persistState() {
+        try {
+            prefs?.edit()
+                ?.putString("lastHash", Base64.encodeToString(lastHash, Base64.NO_WRAP))
+                ?.putString("indexCounter", indexCounter.get().toString())
+                ?.apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    /* =========================================================================
+     * ✅ PRIMARY APPEND (D2 + D1)
+     * ========================================================================= */
+
+    suspend fun append(
         evidence: NormalizedForensicEvidence
     ): ForensicAuditRecord {
 
-        /* ====================================================================
-         * BUILD NEW AUDIT RECORD (WITHOUT HASH)
-         * ==================================================================== */
-        val record =
-            ForensicAuditRecord(
-                index =
-                    indexCounter.incrementAndGet(),
+        /** ✅ Build record */
+        val record = ForensicAuditRecord(
+            index = indexCounter.incrementAndGet(),
+            timestampMillis = evidence.timestampMillis,
+            snapshotId = evidence.snapshotId,
+            decision = evidence.decision,
+            snapshotHash = evidence.snapshotHash, // ✅ FIXED
+            resultHash = ByteArray(0),
+            previousHash = lastHash
+        )
 
-                timestampMillis =
-                    evidence.timestampMillis,
+        /** ✅ Compute chain hash */
+        val hash = ForensicAuditHasher.compute(record)
 
-                snapshotId =
-                    evidence.snapshotId,
+        val finalRecord = record.copy(resultHash = hash)
 
-                decision =
-                    evidence.decision,
-
-                resultHash =
-                    ByteArray(0), // placeholder (computed next)
-
-                previousHash =
-                    lastHash
-            )
-
-        /* ====================================================================
-         * COMPUTE HASH (CHAINING STEP)
-         * ====================================================================
-         *
-         * The hash covers:
-         *  - record metadata
-         *  - decision outcome
-         *  - previous record hash
-         *
-         * Any modification to ANY field breaks the chain.
-         */
-        val hash =
-            ForensicAuditHasher.compute(record)
-
-        val finalRecord =
-            record.copy(resultHash = hash)
-
-        /* ====================================================================
-         * UPDATE CHAIN STATE
-         * ==================================================================== */
+        /** ✅ Update chain */
         lastHash = hash
+        persistState()
 
-        /* ====================================================================
-         * PERSISTENCE HOOK
-         * ====================================================================
-         *
-         * 🔒 IMPORTANT:
-         * Actual storage implementation is intentionally omitted here.
-         *
-         * This design:
-         *  - Keeps forensic logic independent of storage technology
-         *  - Allows future migration without breaking the chain
-         */
-//      persist(finalRecord)
+        /** ✅ D1 persistence */
+        repository?.append(finalRecord.toEntity())
 
         return finalRecord
     }
+
+    /* =========================================================================
+     * ✅ INITIATED (C2)
+     * ========================================================================= */
+
+    suspend fun preLogInitiated(
+        employeeId: String,
+        timestamp: Long
+    ): ForensicAuditRecord {
+
+        val record = ForensicAuditRecord(
+            index = indexCounter.incrementAndGet(),
+            timestampMillis = timestamp,
+            snapshotId = "INIT-$employeeId-$timestamp",
+            decision = "INITIATED",
+            snapshotHash = ByteArray(0),
+            resultHash = ByteArray(0),
+            previousHash = lastHash
+        )
+
+        val hash = ForensicAuditHasher.compute(record)
+
+        val finalRecord = record.copy(resultHash = hash)
+
+        lastHash = hash
+        persistState()
+
+        repository?.append(finalRecord.toEntity())
+
+        return finalRecord
+    }
+
+    /* =========================================================================
+     * ✅ SYSTEM EVENTS
+     * ========================================================================= */
+
+    suspend fun appendSystemEvent(
+        event: String,
+        details: String
+    ): ForensicAuditRecord {
+
+        val now = System.currentTimeMillis()
+
+        val record = ForensicAuditRecord(
+            index = indexCounter.incrementAndGet(),
+            timestampMillis = now,
+            snapshotId = "SYS-$event-$now",
+            decision = "$event|$details",
+            snapshotHash = ByteArray(0),
+            resultHash = ByteArray(0),
+            previousHash = lastHash
+        )
+
+        val hash = ForensicAuditHasher.compute(record)
+
+        val finalRecord = record.copy(resultHash = hash)
+
+        lastHash = hash
+        persistState()
+
+        repository?.append(finalRecord.toEntity())
+
+        return finalRecord
+    }
+}
+
+/* ============================================================================
+ * ✅ ENTITY MAPPER
+ * ========================================================================== */
+
+private fun ForensicAuditRecord.toEntity(): com.mahmoud.attendify.forensics.db.ForensicAuditEntity {
+    return com.mahmoud.attendify.forensics.db.ForensicAuditEntity(
+        index = index,
+        timestampMillis = timestampMillis,
+        snapshotId = snapshotId,
+        decision = decision,
+        snapshotHash = snapshotHash,
+        resultHash = resultHash,
+        previousHash = previousHash
+    )
 }

@@ -4,33 +4,43 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.SystemClock
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
 import com.mahmoud.attendify.system.location.zones.LocationZonesPolicy
 import com.mahmoud.attendify.system.location.zones.ZoneDecision
 import com.mahmoud.attendify.system.location.zones.ZonePolicy
+
+import java.security.MessageDigest
 import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * LocationIntegrityGuard
+ * ============================================================================
+ * LocationIntegrityGuard — FINAL (Military‑Grade Implementation)
+ * ============================================================================
  *
- * PURPOSE:
- * --------
- * This class is the ONLY authority responsible for:
- * - evaluating device location,
- * - evaluating network context,
- * - enforcing administrative location & zone policies,
- * - and producing a single deterministic verdict.
+ * ROLE:
+ * ----------------------------------------------------------------------------
+ * The ONLY authority responsible for evaluating:
+ *   - GPS data
+ *   - Network context
+ *   - Policy constraints
+ *   - Zone restrictions
  *
- * CORE PRINCIPLES:
- * ----------------
- * - Context is measured, never trusted.
- * - Policies are applied, never guessed.
- * - Evidence is recorded, never inferred.
+ * And producing:
+ *   → Deterministic, forensic-grade evidence
  *
- * This class does NOT handle:
- * - UI
- * - Justification text
- * - Persistence
+ * ============================================================================
+ * CRITICAL GUARANTEES
+ * ============================================================================
+ *
+ * ✅ Deterministic result for identical inputs
+ * ✅ No cached / reused location accepted silently
+ * ✅ Full policy enforcement
+ * ✅ Evidence is cryptographically bound (NO toString)
+ *
+ * ============================================================================
  */
 class LocationIntegrityGuard(
     private val context: Context,
@@ -40,82 +50,69 @@ class LocationIntegrityGuard(
     private val anchorStorage: LocationAnchorStorage
 ) {
 
-    /**
-     * Evaluates the full location context for an attendance attempt.
-     *
-     * @return LocationIntegrityResult
-     *         - Allowed(evidence)
-     *         - Blocked(reason)
-     */
-    fun evaluate(): LocationIntegrityResult {
+    /* =========================================================================
+     * ✅ ASYNC ENTRY POINT (REQUIRED FOR A1)
+     * ========================================================================= */
+
+    suspend fun awaitFreshLocation(
+        timeoutMs: Long
+    ): LocationIntegrityResult = withContext(Dispatchers.IO) {
 
         /* ==================================================
-         * 1️⃣ GLOBAL DISABLE (ADMIN POLICY)
+         * 1️⃣ GLOBAL DISABLE
          * ================================================== */
         if (!policy.locationVerificationEnabled) {
-            return LocationIntegrityResult.Allowed(
+            return@withContext LocationIntegrityResult.Allowed(
                 evidence = buildNoLocationEvidence()
             )
         }
 
         /* ==================================================
-         * 2️⃣ NETWORK CONTEXT RESOLUTION & ENFORCEMENT
+         * 2️⃣ NETWORK CONTEXT
          * ================================================== */
         val networkContext = resolveNetworkContext()
 
         when (networkContext) {
             NetworkContext.WIFI ->
-                if (!policy.allowWifi) {
-                    return LocationIntegrityResult.Blocked(
-                        reason = "Attendance via Wi‑Fi is disallowed by policy"
-                    )
-                }
+                if (!policy.allowWifi)
+                    return@withContext block("Wi‑Fi disallowed")
 
             NetworkContext.CELLULAR ->
-                if (!policy.allowCellular) {
-                    return LocationIntegrityResult.Blocked(
-                        reason = "Attendance via Cellular is disallowed by policy"
-                    )
-                }
+                if (!policy.allowCellular)
+                    return@withContext block("Cellular disallowed")
 
             NetworkContext.OFFLINE ->
-                if (!policy.allowOffline) {
-                    return LocationIntegrityResult.Blocked(
-                        reason = "Offline attendance is disallowed by policy"
-                    )
-                }
+                if (!policy.allowOffline)
+                    return@withContext block("Offline disallowed")
         }
 
         /* ==================================================
-         * 3️⃣ ACQUIRE FRESH GPS LOCATION (TIME‑BOUNDED)
+         * 3️⃣ ASYNC GPS FIX
          * ================================================== */
-        val snapshot = locationSource.getFreshLocation(
-            timeoutSeconds = policy.locationFixTimeoutSeconds
-        )
-
-        if (snapshot == null) {
-            return handleLocationTimeout(networkContext)
-        }
+        val snapshot =
+            locationSource.awaitFreshLocation(timeoutMs)
+                ?: return@withContext handleLocationTimeout(networkContext)
 
         /* ==================================================
-         * 4️⃣ STALE FIX DETECTION
+         * 4️⃣ STALE DETECTION
          * ================================================== */
-        val fixAgeMillis =
+        val age =
             abs(SystemClock.elapsedRealtime() - snapshot.elapsedRealtimeMillis)
 
-        if (fixAgeMillis > policy.locationFixTimeoutSeconds * 1000) {
-            return handleLocationTimeout(networkContext)
+        if (age > policy.locationFixTimeoutSeconds * 1000) {
+            return@withContext handleLocationTimeout(networkContext)
         }
 
         /* ==================================================
-         * 5️⃣ TELEPORTATION DETECTION (CROSS‑SESSION)
+         * 5️⃣ TELEPORTATION DETECTION
          * ================================================== */
         var teleportDetected = false
 
         if (anchorStorage.hasLastLocation()) {
+
             val last = anchorStorage.loadLastLocation()
 
-            val distanceMeters = haversineDistance(
+            val distance = haversineDistance(
                 last.latitude,
                 last.longitude,
                 snapshot.latitude,
@@ -126,207 +123,210 @@ class LocationIntegrityGuard(
                 abs(snapshot.elapsedRealtimeMillis - last.elapsedRealtimeMillis) / 1000.0
 
             if (deltaSeconds > 0) {
-                val speedMps = distanceMeters / deltaSeconds
-                teleportDetected = speedMps > policy.maxHumanSpeedMetersPerSecond
+                val speed = distance / deltaSeconds
+                teleportDetected =
+                    speed > policy.maxHumanSpeedMetersPerSecond
             }
         }
 
-        if (teleportDetected && policy.blockOnTeleportation) {
-            return LocationIntegrityResult.Blocked(
-                reason = "Teleportation detected by policy"
-            )
-        }
+        if (teleportDetected && policy.blockOnTeleportation)
+            return@withContext block("Teleportation detected")
 
         /* ==================================================
-         * 6️⃣ MOCK LOCATION (RISK SIGNAL)
+         * 6️⃣ MOCK LOCATION
          * ================================================== */
-        if (snapshot.isMock && policy.blockOnMockLocation) {
-            return LocationIntegrityResult.Blocked(
-                reason = "Mock location detected by policy"
-            )
-        }
+        if (snapshot.isMock && policy.blockOnMockLocation)
+            return@withContext block("Mock location detected")
 
         /* ==================================================
-         * 7️⃣ ZONE EVALUATION (ADMINISTRATIVE CONTEXT)
+         * 7️⃣ ZONE EVALUATION
          * ================================================== */
-        val zoneDecision = evaluateZones(
-            snapshot.latitude,
-            snapshot.longitude
-        )
+        val zoneDecision =
+            evaluateZones(snapshot.latitude, snapshot.longitude)
 
-        if (zoneDecision != null && zoneDecision.policy == ZonePolicy.BLOCK) {
+        if (zoneDecision?.policy == ZonePolicy.BLOCK) {
 
-            /*
-             * 🔒 STEP 1.2 — NETWORK HARD RULE
-             *
-             * Inside BLOCK zones:
-             * - GPS location == spatial proof → hard block
-             * - Network location == contextual claim → allowed WITH EVIDENCE
-             *
-             * This prevents:
-             * - Phantom Wi‑Fi attacks
-             * - BSSID spoofing
-             * - Silent false presence
-             *
-             * Without breaking operational continuity.
-             */
             val isNetworkProvider =
-                snapshot.provider.equals("network", ignoreCase = true)
+                snapshot.provider.equals("network", true)
 
             if (isNetworkProvider) {
-
                 anchorStorage.saveLastLocation(snapshot)
 
-                val evidence = LocationEvidence(
-                    latitude = if (snapshot.isMock) null else snapshot.latitude,
-                    longitude = if (snapshot.isMock) null else snapshot.longitude,
-                    accuracyMeters = snapshot.accuracyMeters,
-                    provider = snapshot.provider,
-
-                    isMockDetected = snapshot.isMock,
-                    isStale = false,
-                    teleportDetected = teleportDetected,
-
-                    distanceToAllowedZoneMeters = zoneDecision.distanceMeters,
-                    zoneDecision = zoneDecision,
-
-                    policyDecision = LocationDecision.ALLOWED_WITH_EVIDENCE,
-                    justificationRequired = true,
-
-                    networkContext = networkContext,
-                    timestampMillis = snapshot.timestampMillis,
-                    signature = LocationSigner.sign(snapshot.toString())
+                return@withContext allowed(
+                    snapshot,
+                    networkContext,
+                    teleportDetected,
+                    zoneDecision,
+                    LocationDecision.ALLOWED_WITH_EVIDENCE,
+                    true
                 )
-
-                return LocationIntegrityResult.Allowed(evidence)
             }
 
-            return LocationIntegrityResult.Blocked(
-                reason = "Blocked by zone policy"
-            )
+            return@withContext block("Blocked by zone policy")
         }
 
         /* ==================================================
-         * 8️⃣ SAVE LOCATION ANCHOR
+         * 8️⃣ SAVE ANCHOR
          * ================================================== */
         anchorStorage.saveLastLocation(snapshot)
 
         /* ==================================================
-         * 9️⃣ JUSTIFICATION AGGREGATION
+         * 9️⃣ JUSTIFICATION
          * ================================================== */
         val justificationRequired =
-            (networkContext == NetworkContext.WIFI && policy.requireJustificationOnWifi) ||
-                    (networkContext == NetworkContext.OFFLINE && policy.requireJustificationOnOffline) ||
-                    (teleportDetected && policy.allowWithTamperEvidence) ||
-                    (snapshot.isMock && policy.allowWithTamperEvidence) ||
+            (networkContext == NetworkContext.WIFI &&
+                    policy.requireJustificationOnWifi) ||
+                    (networkContext == NetworkContext.OFFLINE &&
+                            policy.requireJustificationOnOffline) ||
+                    teleportDetected ||
+                    snapshot.isMock ||
                     (zoneDecision?.policy == ZonePolicy.ALLOW_WITH_JUSTIFICATION)
 
         /* ==================================================
-         * 🔟 BUILD FORENSIC EVIDENCE
+         * 🔟 FINAL RESULT
          * ================================================== */
-        val evidence = LocationEvidence(
-            latitude = if (snapshot.isMock) null else snapshot.latitude,
-            longitude = if (snapshot.isMock) null else snapshot.longitude,
-            accuracyMeters = snapshot.accuracyMeters,
-            provider = snapshot.provider,
-
-            isMockDetected = snapshot.isMock,
-            isStale = false,
-            teleportDetected = teleportDetected,
-
-            distanceToAllowedZoneMeters = zoneDecision?.distanceMeters,
-            zoneDecision = zoneDecision,
-
-            policyDecision =
-                if (teleportDetected || snapshot.isMock)
-                    LocationDecision.ALLOWED_WITH_EVIDENCE
-                else
-                    LocationDecision.ALLOWED,
-
-            justificationRequired = justificationRequired,
-            networkContext = networkContext,
-            timestampMillis = snapshot.timestampMillis,
-            signature = LocationSigner.sign(snapshot.toString())
+        return@withContext allowed(
+            snapshot,
+            networkContext,
+            teleportDetected,
+            zoneDecision,
+            if (teleportDetected || snapshot.isMock)
+                LocationDecision.ALLOWED_WITH_EVIDENCE
+            else
+                LocationDecision.ALLOWED,
+            justificationRequired
         )
-
-        return LocationIntegrityResult.Allowed(evidence)
     }
 
-    /* ==================================================
-     * ZONE EVALUATION
-     * ================================================== */
+    /* =========================================================================
+     * ✅ CANONICAL PAYLOAD (CRITICAL FIX)
+     * ========================================================================= */
+    private fun buildCanonicalLocationPayload(
+        snapshot: LocationSnapshot
+    ): ByteArray {
+
+        return (
+                snapshot.latitude.toString() +
+                        snapshot.longitude.toString() +
+                        snapshot.accuracyMeters.toString() +
+                        snapshot.provider +
+                        snapshot.isMock.toString() +
+                        snapshot.elapsedRealtimeMillis.toString() +
+                        snapshot.timestampMillis.toString()
+                ).toByteArray(Charsets.UTF_8)
+    }
+
+    /* =========================================================================
+     * HELPER: CREATE ALLOWED RESULT WITH SECURE SIGNATURE
+     * ========================================================================= */
+
+    private fun allowed(
+        snapshot: LocationSnapshot,
+        networkContext: NetworkContext,
+        teleportDetected: Boolean,
+        zoneDecision: ZoneDecision?,
+        decision: LocationDecision,
+        justificationRequired: Boolean
+    ) = LocationIntegrityResult.Allowed(
+
+        run {
+
+            val payload = buildCanonicalLocationPayload(snapshot)
+
+            val hash = MessageDigest
+                .getInstance("SHA-256")
+                .digest(payload)
+
+            LocationEvidence(
+                latitude = if (snapshot.isMock) null else snapshot.latitude,
+                longitude = if (snapshot.isMock) null else snapshot.longitude,
+                accuracyMeters = snapshot.accuracyMeters,
+                provider = snapshot.provider,
+
+                isMockDetected = snapshot.isMock,
+                isStale = false,
+                teleportDetected = teleportDetected,
+
+                distanceToAllowedZoneMeters = zoneDecision?.distanceMeters,
+                zoneDecision = zoneDecision,
+
+                policyDecision = decision,
+                justificationRequired = justificationRequired,
+                networkContext = networkContext,
+                timestampMillis = snapshot.timestampMillis,
+
+                // ✅ FIXED (NO toString)
+                signature = LocationSigner.sign(hash)
+            )
+        }
+    )
+
+    private fun block(reason: String) =
+        LocationIntegrityResult.Blocked(reason)
+
+    /* ========================================================================= */
+
     private fun evaluateZones(
-        latitude: Double,
-        longitude: Double
+        lat: Double,
+        lon: Double
     ): ZoneDecision? {
 
         val zones = zonesPolicy?.zones ?: return null
 
         for (zone in zones) {
+
             val distance = haversineDistance(
                 zone.latitude,
                 zone.longitude,
-                latitude,
-                longitude
+                lat,
+                lon
             )
 
             if (distance <= zone.radiusMeters) {
-                return ZoneDecision(
-                    matchedZone = zone,
-                    distanceMeters = distance,
-                    policy = zone.insidePolicy
-                )
+                return ZoneDecision(zone, distance, zone.insidePolicy)
             }
         }
 
         return ZoneDecision(
-            matchedZone = null,
-            distanceMeters = null,
-            policy = zonesPolicy.defaultPolicyOutsideAllZones
+            null,
+            null,
+            zonesPolicy.defaultPolicyOutsideAllZones
         )
     }
 
-    /* ==================================================
-     * GPS TIMEOUT HANDLING
-     * ================================================== */
+    /* ========================================================================= */
+
     private fun handleLocationTimeout(
         networkContext: NetworkContext
     ): LocationIntegrityResult =
         when (policy.onLocationTimeout) {
 
             LocationTimeoutAction.BLOCK ->
-                LocationIntegrityResult.Blocked(
-                    reason = "GPS fix timeout exceeded"
-                )
+                block("GPS timeout")
 
             LocationTimeoutAction.ALLOW_WITH_EVIDENCE ->
                 LocationIntegrityResult.Allowed(
-                    evidence = buildTimeoutEvidence(
-                        false,
-                        networkContext
-                    )
+                    buildTimeoutEvidence(false, networkContext)
                 )
 
             LocationTimeoutAction.ALLOW_WITH_JUSTIFICATION ->
                 LocationIntegrityResult.Allowed(
-                    evidence = buildTimeoutEvidence(
-                        true,
-                        networkContext
-                    )
+                    buildTimeoutEvidence(true, networkContext)
                 )
         }
 
-    /* ==================================================
-     * NETWORK CONTEXT RESOLUTION
-     * ================================================== */
+    /* ========================================================================= */
+
     private fun resolveNetworkContext(): NetworkContext {
+
         val cm =
             context.getSystemService(Context.CONNECTIVITY_SERVICE)
                     as? ConnectivityManager
                 ?: return NetworkContext.OFFLINE
 
         val network = cm.activeNetwork ?: return NetworkContext.OFFLINE
-        val caps = cm.getNetworkCapabilities(network) ?: return NetworkContext.OFFLINE
+        val caps = cm.getNetworkCapabilities(network)
+            ?: return NetworkContext.OFFLINE
 
         return when {
             caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ->
@@ -340,9 +340,8 @@ class LocationIntegrityGuard(
         }
     }
 
-    /* ==================================================
-     * EVIDENCE HELPERS
-     * ================================================== */
+    /* ========================================================================= */
+
     private fun buildNoLocationEvidence(): LocationEvidence =
         LocationEvidence(
             latitude = null,
@@ -360,7 +359,9 @@ class LocationIntegrityGuard(
             policyDecision = LocationDecision.ALLOWED,
             justificationRequired = false,
             networkContext = NetworkContext.OFFLINE,
+
             timestampMillis = System.currentTimeMillis(),
+
             signature = LocationSigner.sign("LOCATION_DISABLED")
         )
 
@@ -384,20 +385,20 @@ class LocationIntegrityGuard(
             policyDecision = LocationDecision.ALLOWED_WITH_EVIDENCE,
             justificationRequired = justificationRequired,
             networkContext = networkContext,
+
             timestampMillis = System.currentTimeMillis(),
+
             signature = LocationSigner.sign("GPS_TIMEOUT")
         )
 
-    /* ==================================================
-     * DISTANCE CALCULATION
-     * ================================================== */
+    /* ========================================================================= */
+
     private fun haversineDistance(
-        lat1: Double,
-        lon1: Double,
-        lat2: Double,
-        lon2: Double
+        lat1: Double, lon1: Double,
+        lat2: Double, lon2: Double
     ): Double {
-        val earthRadiusMeters = 6_371_000.0
+
+        val r = 6_371_000.0
 
         val dLat = Math.toRadians(lat2 - lat1)
         val dLon = Math.toRadians(lon2 - lon1)
@@ -409,11 +410,9 @@ class LocationIntegrityGuard(
                     kotlin.math.sin(dLon / 2) *
                     kotlin.math.sin(dLon / 2)
 
-        return 2 *
-                earthRadiusMeters *
-                kotlin.math.atan2(
-                    sqrt(a),
-                    sqrt(1 - a)
-                )
+        return 2 * r * kotlin.math.atan2(
+            sqrt(a),
+            sqrt(1 - a)
+        )
     }
 }

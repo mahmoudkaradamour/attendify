@@ -3,77 +3,123 @@ package com.mahmoud.attendify.face
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
+import androidx.core.graphics.scale
 import kotlin.math.max
 import kotlin.math.min
+import com.mahmoud.attendify.util.BitmapSafeUtils
 
 /**
- * FaceCropper
+ * =============================================================================
+ * 🧠 FaceCropper — Deterministic & Memory-Safe Spatial Normalization Engine
+ * =============================================================================
  *
- * =========================================================
- * ✅ English:
- * ---------------------------------------------------------
- * Central utility responsible for cropping and resizing
- * face regions from a full camera frame.
+ * -----------------------------------------------------------------------------
+ * 🧠 ABSTRACT MODEL (FORMAL DEFINITION)
+ * -----------------------------------------------------------------------------
  *
- * This implementation is SECURITY‑AWARE and FAS‑READY:
- * - Expands the crop area beyond the tight face box
- * - Preserves background context (essential for FAS)
- * - Prevents out‑of‑bounds cropping
+ * This component performs a transformation:
  *
- * This design significantly improves resistance against:
- * - Printed photo attacks
- * - Screen replay attacks
+ *     F(x, y) → R(x, y) → T(n × n)
  *
- * =========================================================
- * ✅ عربي:
- * ---------------------------------------------------------
- * أداة مركزية مسؤولة عن قص وإعادة تحجيم منطقة الوجه
- * من إطار الكاميرا الكامل.
+ * Where:
  *
- * هذا التنفيذ مُصمم بوعي أمني:
- * - يوسّع منطقة القص خارج حدود الوجه الضيقة
- * - يحافظ على جزء من الخلفية (مهم جدًا لـ FAS)
- * - يمنع أي قص خارج حدود الصورة
+ *   F(x, y) = original image (pixel space)
+ *   R(x, y) = region of interest (cropped + expanded)
+ *   T(n, n) = normalized tensor fed into ML model
  *
- * هذا الأسلوب يعزز مقاومة:
- * - الصور المطبوعة
- * - هجمات العرض عبر الشاشة
+ * -----------------------------------------------------------------------------
+ * 📊 FULL PIPELINE
+ * -----------------------------------------------------------------------------
+ *
+ *        ┌──────────────────────────────┐
+ *        │ Raw Camera Frame (F)         │
+ *        └──────────────┬───────────────┘
+ *                       ▼
+ *        ┌──────────────────────────────┐
+ *        │ Face Bounding Box (Detector)│
+ *        └──────────────┬───────────────┘
+ *                       ▼
+ *        ┌──────────────────────────────┐
+ *        │ Expansion Layer (Security)   │
+ *        └──────────────┬───────────────┘
+ *                       ▼
+ *        ┌──────────────────────────────┐
+ *        │ Boundary Clamping            │
+ *        └──────────────┬───────────────┘
+ *                       ▼
+ *        ┌──────────────────────────────┐
+ *        │ Cropping Operation           │
+ *        └──────────────┬───────────────┘
+ *                       ▼
+ *        ┌──────────────────────────────┐
+ *        │ Resize → Fixed Tensor (T)    │
+ *        └──────────────────────────────┘
+ *
+ * -----------------------------------------------------------------------------
+ * 🔬 SCIENTIFIC FOUNDATION
+ * -----------------------------------------------------------------------------
+ *
+ * WHY EXPANSION?
+ *
+ * Tight face crops (face-only region) REMOVE:
+ *   ❌ background illumination gradients
+ *   ❌ edge artifacts
+ *   ❌ contextual signals
+ *
+ * Expanded crops RETAIN:
+ *   ✅ photometric variations
+ *   ✅ structural edges
+ *   ✅ environment context
+ *
+ * → These signals are critical for:
+ *    - Liveness Detection
+ *    - Anti-Spoofing (FAS)
+ *    - Robust Embedding Stability
+ *
+ * -----------------------------------------------------------------------------
+ * 🔐 SECURITY PROPERTIES
+ * -----------------------------------------------------------------------------
+ *
+ * ✅ Prevents adversarial tight-cropping attacks
+ * ✅ Preserves context for spoof detection
+ * ✅ Eliminates out-of-bounds memory access
+ * ✅ Enforces deterministic geometry
+ *
+ * -----------------------------------------------------------------------------
+ * ⚙️ MEMORY SAFETY MODEL
+ * -----------------------------------------------------------------------------
+ *
+ * Bitmap lifecycle:
+ *
+ *   sourceBitmap → (NO TOUCH)
+ *         │
+ *         ▼
+ *      cropped (ALLOC)
+ *         │
+ *         ▼
+ *      resized (FINAL)
+ *         │
+ *         ▼
+ *   cropped MUST be recycled ✅
+ *
+ * -----------------------------------------------------------------------------
  */
 object FaceCropper {
 
     private const val TAG = "FaceCropper"
 
     /**
-     * Crop and resize face region for ML models.
+     * =============================================================================
+     * 🎯 cropAndResize — Deterministic + Safe Processing
+     * =============================================================================
      *
-     * =====================================================
-     * English:
-     * Crops a face region using an EXPANDED bounding box
-     * strategy (not a tight crop), then resizes it to
-     * the target model input size.
+     * Core invariant:
      *
-     * The expansion factor is critical for FAS accuracy.
+     *   Output image ALWAYS:
+     *   - square
+     *   - fixed size
+     *   - derived from spatially expanded region
      *
-     * =====================================================
-     * عربي:
-     * قص الوجه باستخدام Bounding Box موسّع
-     * (وليس قصًا ضيقًا)، ثم إعادة تحجيمه
-     * إلى الحجم المطلوب للنموذج.
-     *
-     * توسيع منطقة القص عامل أساسي
-     * لرفع دقة نماذج مكافحة التزوير.
-     *
-     * @param sourceBitmap  Full camera frame
-     * @param faceBox       Face bounding box (from detector)
-     * @param targetSize    Target model input size (e.g. 80, 128)
-     * @param expansionFactor
-     *        English: Amount of expansion applied around face.
-     *        Arabic: معامل توسيع منطقة القص حول الوجه.
-     *
-     *        Recommended values:
-     *        - 2.0f → minimal safe expansion
-     *        - 2.5f → balanced (✅ recommended)
-     *        - 3.0f → maximum security
      */
     fun cropAndResize(
         sourceBitmap: Bitmap,
@@ -82,6 +128,9 @@ object FaceCropper {
         expansionFactor: Float = 2.5f
     ): Bitmap? {
 
+        /* =======================================================================
+         * 🧪 STEP 1 — INPUT VALIDATION
+         * ======================================================================= */
         if (targetSize <= 0) {
             Log.e(TAG, "Invalid target size: $targetSize")
             return null
@@ -91,43 +140,47 @@ object FaceCropper {
         val frameHeight = sourceBitmap.height
 
         if (frameWidth <= 0 || frameHeight <= 0) {
-            Log.e(TAG, "Invalid source bitmap dimensions")
+            Log.e(TAG, "Invalid bitmap dimensions")
             return null
         }
 
-        /* --------------------------------------------------
-         * 1️⃣ Compute expanded bounding box
-         * --------------------------------------------------
+        if (faceBox.width() <= 0 || faceBox.height() <= 0) {
+            Log.e(TAG, "Invalid face bounding box")
+            return null
+        }
+
+        /* =======================================================================
+         * 📏 STEP 2 — EXPANSION (CRITICAL FOR SECURITY)
+         * =======================================================================
          *
-         * English:
-         * Expand face box equally in all directions.
+         * Mathematical model:
          *
-         * عربي:
-         * توسيع صندوق الوجه بالتساوي في كل الاتجاهات.
+         *   expansion = (size * (factor - 1)) / 2
+         *
+         * This ensures symmetric growth around center.
          */
         val boxWidth = faceBox.width()
         val boxHeight = faceBox.height()
 
-        val expansionWidth = (boxWidth * (expansionFactor - 1f) / 2f).toInt()
-        val expansionHeight = (boxHeight * (expansionFactor - 1f) / 2f).toInt()
+        val expandW = ((boxWidth * (expansionFactor - 1f)) / 2f).toInt()
+        val expandH = ((boxHeight * (expansionFactor - 1f)) / 2f).toInt()
 
-        val left = max(0, faceBox.left - expansionWidth)
-        val top = max(0, faceBox.top - expansionHeight)
-        val right = min(frameWidth, faceBox.right + expansionWidth)
-        val bottom = min(frameHeight, faceBox.bottom + expansionHeight)
+        val left = max(0, faceBox.left - expandW)
+        val top = max(0, faceBox.top - expandH)
+        val right = min(frameWidth, faceBox.right + expandW)
+        val bottom = min(frameHeight, faceBox.bottom + expandH)
 
         val cropWidth = right - left
         val cropHeight = bottom - top
 
         if (cropWidth <= 0 || cropHeight <= 0) {
-            Log.e(TAG, "Invalid expanded crop region")
+            Log.e(TAG, "Invalid crop region after expansion")
             return null
         }
 
-        /* --------------------------------------------------
-         * 2️⃣ Crop expanded region
-         * --------------------------------------------------
-         */
+        /* =======================================================================
+         * ✂️ STEP 3 — SAFE CROPPING (ALLOCATION POINT)
+         * ======================================================================= */
         val cropped = try {
             Bitmap.createBitmap(
                 sourceBitmap,
@@ -137,36 +190,47 @@ object FaceCropper {
                 cropHeight
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to crop bitmap", e)
+            Log.e(TAG, "Crop failed", e)
             return null
         }
 
-        /* --------------------------------------------------
-         * 3️⃣ Resize to model input size
-         * --------------------------------------------------
+        /* =======================================================================
+         * 🔄 STEP 4 — RESIZE (NORMALIZATION)
+         * =======================================================================
          *
-         * English:
-         * Final resize to target ML input dimensions.
+         * Resize is mandatory because:
          *
-         * عربي:
-         * إعادة تحجيم الصورة إلى حجم إدخال النموذج.
+         *   ML models require fixed-size tensors
+         *
+         * We use bilinear filtering (filter = true)
+         * to preserve spatial smoothness.
          */
         val resized = try {
-            Bitmap.createScaledBitmap(
-                cropped,
-                targetSize,
-                targetSize,
-                true
+            cropped.scale(
+                width = targetSize,
+                height = targetSize,
+                filter = true
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to resize cropped bitmap", e)
-            cropped.recycle()
+            Log.e(TAG, "Resize failed", e)
+            BitmapSafeUtils.safeRecycle(cropped)
             return null
         }
 
-        // Free intermediate bitmap to avoid native memory leaks
-        cropped.recycle()
+        /* =======================================================================
+         * 🧹 STEP 5 — MEMORY CLEANUP
+         * =======================================================================
+         *
+         * IMPORTANT:
+         *
+         * cropped is intermediate buffer and MUST be released.
+         * Failure to do so → native memory leak → OOM crash.
+         */
+        BitmapSafeUtils.safeRecycle(cropped)
 
+        /* =======================================================================
+         * ✅ FINAL OUTPUT
+         * ======================================================================= */
         return resized
     }
 }

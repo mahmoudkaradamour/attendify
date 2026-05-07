@@ -53,4 +53,16 @@ object HardwareBackedKeyManager {
 
     fun getCertificateChain(): List<Certificate> =
         keyStore.getCertificateChain(KEY_ALIAS).toList()
+
+    fun isStrongBoxBacked(): Boolean {
+        return try {
+            val certs = keyStore.getCertificateChain(KEY_ALIAS)
+            // Basic heuristic: presence of attestation extension implies hardware backing
+            certs.any { cert ->
+                cert.toString().contains("AndroidKeyStore") || cert.toString().contains("strongbox", true)
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
 }

@@ -2,11 +2,17 @@ package com.mahmoud.attendify.orchestration
 
 import java.util.UUID
 import java.security.MessageDigest
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 import com.mahmoud.attendify.camera.CameraManager
 import com.mahmoud.attendify.system.time.TimeSource
+import com.mahmoud.attendify.system.time.TimeSnapshot
 import com.mahmoud.attendify.system.location.LocationIntegrityGuard
 import com.mahmoud.attendify.system.location.LocationIntegrityResult
+import com.mahmoud.attendify.system.location.LocationEvidence
 
 import com.mahmoud.attendify.orchestration.context.PhysicalRealitySnapshot
 import com.mahmoud.attendify.orchestration.context.SignedPhysicalRealitySnapshot
@@ -15,188 +21,345 @@ import com.mahmoud.attendify.security.HardwareBackedSnapshotSigner
 import com.mahmoud.attendify.security.HardwareBackedKeyManager
 
 /**
- * ============================================================================
- * PhysicalRealityBuilder
- * ============================================================================
+ * =============================================================================
+ * 🔬 PhysicalRealityBuilder — Deterministic Reality Binding Engine
+ * =============================================================================
  *
- * ROLE:
- * ----------------------------------------------------------------------------
- * The SINGLE authority responsible for capturing and sealing
- * **atomic physical reality**.
+ * -----------------------------------------------------------------------------
+ * 🧠 ABSTRACT MODEL
+ * -----------------------------------------------------------------------------
  *
- * This class owns exclusive access to:
- *  ✅ Camera capture (single frame)
- *  ✅ Time snapshot
- *  ✅ Location integrity evaluation
+ * This component implements a **deterministic, cryptographically bound representation
+ * of physical reality at a single moment in time**.
  *
- * And is responsible for:
- *  ✅ Atomic binding (Frame + Time + Location)
- *  ✅ Cryptographic sealing
- *  ✅ Hardware‑backed attestation (Phase 3.6)
+ * Formally, it constructs:
  *
- * ============================================================================
- * SECURITY MODEL (POST PHASE 3.6)
- * ============================================================================
+ *   R(t) → P → H → Sign(H)
  *
- * • Physical reality is captured ONCE
- * • Data is bound atomically
- * • Snapshot hash is signed using a HARDWARE‑BACKED PRIVATE KEY
- * • Private key NEVER leaves secure hardware (TEE / StrongBox)
+ * Where:
  *
- * This eliminates:
- *  ❌ TOCTOU
- *  ❌ Software key exfiltration
- *  ❌ Replay via cloned signatures
+ *   R(t)  = Physical reality at time t
+ *   P     = Canonical binary representation (deterministic)
+ *   H     = SHA-256(P)
+ *   Sign  = Hardware-backed signature
  *
- * ============================================================================
- * TRUST BOUNDARY
- * ============================================================================
+ * -----------------------------------------------------------------------------
+ * 🔐 SECURITY PROPERTIES
+ * -----------------------------------------------------------------------------
  *
- * Everything outside this class is considered:
- *  ⚠️ Computationally trusted
+ * 1. Temporal Consistency:
+ *    - Capture order prevents TOCTOU (Time-of-check vs Time-of-use)
  *
- * Everything produced by this class is:
- *  ✅ Cryptographically and physically attested
+ * 2. Deterministic Encoding:
+ *    - Identical input → identical byte stream → identical hash
+ *
+ * 3. Cryptographic Binding:
+ *    - Any bit modification breaks SHA-256 → invalid signature
+ *
+ * 4. Hardware Trust:
+ *    - Signature bound to Keystore (TEE / StrongBox)
+ *
+ * -----------------------------------------------------------------------------
+ * 📊 PIPELINE DIAGRAM
+ * -----------------------------------------------------------------------------
+ *
+ *   ┌──────────────┐
+ *   │ GPS Fix      │
+ *   └──────┬───────┘
+ *          │
+ *          ▼
+ *   ┌──────────────┐
+ *   │ Camera Frame │
+ *   └──────┬───────┘
+ *          │
+ *          ▼
+ *   ┌──────────────┐
+ *   │ Time Snapshot│
+ *   └──────┬───────┘
+ *          │
+ *          ▼
+ *   ┌────────────────────────────┐
+ *   │ Canonical Payload Builder │
+ *   │ (image + time + location) │
+ *   └──────────────┬────────────┘
+ *                  ▼
+ *             SHA-256 Hash
+ *                  ▼
+ *         Hardware Signature
+ *                  ▼
+ *   SignedPhysicalRealitySnapshot ✅
+ *
+ * -----------------------------------------------------------------------------
+ * ⚠️ CRITICAL DESIGN DECISION
+ * -----------------------------------------------------------------------------
+ *
+ * The payload MUST:
+ * ✅ Be deterministic
+ * ✅ Have fixed ordering
+ * ✅ Avoid encoding ambiguity
+ * ✅ Be independent from runtime string formatting
+ *
+ * This prevents:
+ * ❌ Serialization attacks
+ * ❌ Data reordering attacks
+ * ❌ Encoding inconsistencies
+ *
  */
 class PhysicalRealityBuilder(
     private val cameraManager: CameraManager,
     private val locationIntegrityGuard: LocationIntegrityGuard
 ) {
 
-    /**
+    /* =========================================================================
+     * 🧮 PRIMITIVE ENCODING (DETERMINISTIC BINARY FORM)
      * =========================================================================
-     * buildSignedOrFail
-     * =========================================================================
      *
-     * Captures, binds, hashes, and SIGNs physical reality
-     * using hardware‑backed cryptographic keys.
+     * PURPOSE:
+     * Convert high-level data types into fixed, deterministic byte sequences.
      *
-     * GUARANTEES:
-     * ------------------------------------------------------------------------
-     * ✅ Frame, time, and location originate from ONE attempt
-     * ✅ Either ALL evidence exists, or NONE exists
-     * ✅ Signature is hardware‑bound to the device
+     * Key idea:
+     *   Every primitive → fixed-size binary representation
      *
-     * FAILURE MODES:
-     * ------------------------------------------------------------------------
-     * - Camera hardware failure
-     * - Location integrity failure
-     * - Cryptographic / Keystore failure
+     * This avoids:
+     * - Locale issues
+     * - String formatting instability
+     * - Platform differences
      */
-    fun buildSignedOrFail(
-        timeoutMs: Long
-    ): Result<SignedPhysicalRealitySnapshot> {
 
-        /* ====================================================================
-         * STEP 1 — CAMERA CAPTURE
-         * ==================================================================== */
-        val frame =
-            cameraManager.captureSingleFrame(timeoutMs)
-                ?: return Result.failure(
-                    IllegalStateException("Camera capture failed")
-                )
+    private fun longToBytes(v: Long) =
+        ByteBuffer.allocate(8).putLong(v).array()
+
+    private fun intToBytes(v: Int) =
+        ByteBuffer.allocate(4).putInt(v).array()
+
+    private fun doubleToBytes(v: Double) =
+        ByteBuffer.allocate(8)
+            .putLong(java.lang.Double.doubleToLongBits(v))
+            .array()
+
+    private fun floatToBytes(v: Float) =
+        ByteBuffer.allocate(4)
+            .putInt(java.lang.Float.floatToIntBits(v))
+            .array()
+
+    private fun booleanToByte(v: Boolean) =
+        byteArrayOf(if (v) 1 else 0)
+
+    /**
+     * -----------------------------------------------------------------------------
+     * 🔤 STRING CANONICALIZATION
+     * -----------------------------------------------------------------------------
+     *
+     * Format:
+     *   [length:4 bytes][UTF-8 bytes]
+     *
+     * Why?
+     *   Prevents concatenation ambiguity:
+     *
+     *   "ab"+"cd" != "abc"+"d"
+     *
+     */
+    private fun stringToBytes(value: String): ByteArray {
+        val raw = value.toByteArray(Charsets.UTF_8)
+        return intToBytes(raw.size) + raw
+    }
+
+    /* =========================================================================
+     * ⏱ TIME SERIALIZATION
+     * ========================================================================= */
+
+    private fun TimeSnapshot.toCanonicalBytes(): ByteArray {
+        return longToBytes(wallClockMillis) +
+                longToBytes(elapsedRealtimeMillis) +
+                longToBytes(uptimeMillis) +
+                stringToBytes(bootId) +
+                stringToBytes(timeZoneId)
+    }
+
+    /* =========================================================================
+     * 📍 LOCATION SERIALIZATION
+     * ========================================================================= */
+
+    private fun LocationEvidence.toCanonicalBytes(): ByteArray {
+
+        val lat = latitude ?: Double.NaN
+        val lon = longitude ?: Double.NaN
+        val acc = accuracyMeters ?: Float.NaN
+
+        return doubleToBytes(lat) +
+                doubleToBytes(lon) +
+                floatToBytes(acc) +
+                stringToBytes(provider) +
+                booleanToByte(isMockDetected) +
+                booleanToByte(isStale) +
+                booleanToByte(teleportDetected) +
+                doubleToBytes(distanceToAllowedZoneMeters ?: Double.NaN) +
+                stringToBytes(zoneDecision?.policy?.name ?: "NONE") +
+                stringToBytes(policyDecision.name) +
+                booleanToByte(justificationRequired) +
+                stringToBytes(networkContext.toString()) +
+                longToBytes(timestampMillis)
+    }
+
+    /* =========================================================================
+     * 🖼 IMAGE HASHING
+     * =========================================================================
+     *
+     * Converts bitmap → deterministic PNG → SHA-256
+     *
+     * Rationale:
+     *   Raw Bitmap memory representation is NOT stable across devices.
+     *
+     * PNG ensures:
+     * ✅ deterministic byte output
+     * ✅ lossless encoding
+     */
+    private fun hashBitmap(bitmap: android.graphics.Bitmap): ByteArray {
+
+        val imageBytes = ByteArrayOutputStream().use { output ->
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output)
+            output.toByteArray()
+        }
+
+        return MessageDigest
+            .getInstance("SHA-256")
+            .digest(imageBytes)
+    }
+
+    /* =========================================================================
+     * 🚀 MAIN PIPELINE
+     * ========================================================================= */
+
+    suspend fun buildSignedOrFail(
+        timeoutMs: Long
+    ): Result<SignedPhysicalRealitySnapshot> = withContext(Dispatchers.IO) {
+
+        /**
+         * ---------------------------------------------------------------------
+         * STEP 1 — LOCATION FIRST (ANCHOR)
+         * ---------------------------------------------------------------------
+         *
+         * Guarantees:
+         * - fresh GPS
+         * - prevents replay of cached location
+         */
+        val locationResult =
+            locationIntegrityGuard.awaitFreshLocation(timeoutMs)
+
+        if (locationResult !is LocationIntegrityResult.Allowed) {
+            return@withContext Result.failure(
+                IllegalStateException("Location integrity failed")
+            )
+        }
+
+        /**
+         * ---------------------------------------------------------------------
+         * STEP 2 — FRAME CAPTURE
+         * ---------------------------------------------------------------------
+         *
+         * Must occur AFTER location to maintain temporal ordering.
+         */
+        val frame = cameraManager.captureSingleFrameSuspend(timeoutMs)
+            ?: return@withContext Result.failure(
+                IllegalStateException("Camera capture failed")
+            )
 
         try {
 
-            /* ================================================================
-             * STEP 2 — TIME SNAPSHOT
-             * ================================================================ */
-            val timeSnapshot =
-                TimeSource.snapshot()
-
-            /* ================================================================
-             * STEP 3 — LOCATION INTEGRITY
-             * ================================================================ */
-            val locationResult =
-                locationIntegrityGuard.evaluate()
-
-            if (locationResult !is LocationIntegrityResult.Allowed) {
-                return Result.failure(
-                    IllegalStateException("Location integrity failed")
-                )
-            }
-
-            /* ================================================================
-             * STEP 4 — ATOMIC REALITY BINDING
-             * ================================================================ */
-            val snapshot =
-                PhysicalRealitySnapshot(
-                    frozenFrame = frame,
-                    timeSnapshot = timeSnapshot,
-                    locationEvidence = locationResult.evidence
-                )
-
-            /* ================================================================
-             * STEP 5 — IDENTIFIERS & TIMESTAMP
-             * ================================================================ */
-            val snapshotId =
-                UUID.randomUUID()
-
-            val timestampMillis =
-                System.currentTimeMillis()
-
-            /* ================================================================
-             * STEP 6 — HASH (DETERMINISTIC REPRESENTATION)
-             * ================================================================
+            /**
+             * -----------------------------------------------------------------
+             * STEP 3 — TIME SNAPSHOT
+             * -----------------------------------------------------------------
              *
-             * NOTE:
-             * - Hashing is performed BEFORE signing
-             * - Snapshot hash is what gets signed
-             * - Ensures deterministic, verifiable input
+             * Captured after frame to bind them in same execution window.
              */
-            val snapshotHash =
-                MessageDigest
-                    .getInstance("SHA-256")
-                    .digest(
-                        snapshot.toString()
-                            .toByteArray(Charsets.UTF_8)
-                    )
+            val timeSnapshot = TimeSource.snapshot()
 
-            /* ================================================================
-             * STEP 7 — HARDWARE‑BACKED SIGNATURE (PHASE 3.6)
-             * ================================================================ */
+            /**
+             * -----------------------------------------------------------------
+             * STEP 4 — RAW SNAPSHOT
+             * -----------------------------------------------------------------
+             */
+            val snapshot = PhysicalRealitySnapshot(
+                frozenFrame = frame,
+                timeSnapshot = timeSnapshot,
+                locationEvidence = locationResult.evidence
+            )
+
+            val snapshotId = UUID.randomUUID()
+            val createdAt = System.currentTimeMillis()
+
+            /**
+             * -----------------------------------------------------------------
+             * STEP 5 — CANONICAL PAYLOAD CONSTRUCTION
+             * -----------------------------------------------------------------
+             *
+             * Structure:
+             *
+             *   [len][imageHash]
+             *   [len][timeBytes]
+             *   [len][locationBytes]
+             *
+             * This ensures:
+             * ✅ Deterministic structure
+             * ✅ Fully reconstructible schema
+             * ✅ Attack-resistant encoding
+             */
+            val imageHash = hashBitmap(frame)
+            val timeBytes = timeSnapshot.toCanonicalBytes()
+            val locationBytes = locationResult.evidence.toCanonicalBytes()
+
+            val payload =
+                intToBytes(imageHash.size) + imageHash +
+                        intToBytes(timeBytes.size) + timeBytes +
+                        intToBytes(locationBytes.size) + locationBytes
+
+            /**
+             * -----------------------------------------------------------------
+             * STEP 6 — HASH
+             * -----------------------------------------------------------------
+             */
+            val payloadHash = MessageDigest
+                .getInstance("SHA-256")
+                .digest(payload)
+
+            /**
+             * -----------------------------------------------------------------
+             * STEP 7 — HARDWARE SIGN
+             * -----------------------------------------------------------------
+             */
             val signature =
-                HardwareBackedSnapshotSigner
-                    .sign(snapshotHash)
+                HardwareBackedSnapshotSigner.sign(payloadHash)
 
-            /* ================================================================
-             * STEP 8 — CERTIFICATE CHAIN EXPORT
-             * ================================================================
-             *
-             * The certificate chain proves:
-             * - Key origin (Android Keystore)
-             * - Hardware‑backed status (TEE / StrongBox)
-             */
             val certificateChain =
-                HardwareBackedKeyManager
-                    .getCertificateChain()
+                HardwareBackedKeyManager.getCertificateChain()
                     .map { it.encoded }
 
-            /* ================================================================
-             * STEP 9 — FINAL SIGNED SNAPSHOT
-             * ================================================================ */
-            return Result.success(
+            /**
+             * -----------------------------------------------------------------
+             * STEP 8 — FINAL OUTPUT
+             * -----------------------------------------------------------------
+             */
+            return@withContext Result.success(
                 SignedPhysicalRealitySnapshot(
                     snapshotId = snapshotId,
-                    timestampMillis = timestampMillis,
+                    timestampMillis = createdAt,
                     payload = snapshot,
                     signature = signature,
-                    certificateChain = certificateChain
+                    certificateChain = certificateChain,
+                    snapshotHash = payloadHash
                 )
             )
 
         } catch (t: Throwable) {
 
-            /* ================================================================
-             * FAILURE SAFETY
-             * ================================================================
-             *
-             * In case of ANY failure:
-             * - Frame is recycled
-             * - Partial evidence is discarded
+            /**
+             * IMPORTANT:
+             * Prevent memory leaks caused by retained bitmaps
              */
             frame.recycle()
-            return Result.failure(t)
+
+            return@withContext Result.failure(t)
         }
     }
 }
