@@ -26,6 +26,7 @@ import com.mahmoud.attendify.security.boundary.AttendanceRequestGate
 import com.mahmoud.attendify.security.boundary.SessionIntegrityGuard
 import com.mahmoud.attendify.security.legal.*
 import com.mahmoud.attendify.security.privacy.*
+import com.mahmoud.attendify.forensics.wal.WalManager
 /* ============================================================================ */
 import com.mahmoud.attendify.forensics.*
 import com.mahmoud.attendify.forensics.integrity.SnapshotVerifier
@@ -36,102 +37,70 @@ import kotlinx.coroutines.withContext
 
 /**
  * =============================================================================
- * 🧠 AttendanceRuntimeOrchestrator — Secure Biometric Transaction Engine
+ * 🧠 AttendanceRuntimeOrchestrator — Transactional Biometric Execution Engine
  * =============================================================================
  *
  * -----------------------------------------------------------------------------
- * 🧠 FORMAL SYSTEM MODEL
+ * 🧠 FORMAL EXECUTION MODEL
  * -----------------------------------------------------------------------------
  *
- * This class implements a **deterministic transactional execution pipeline**
- * over real-world biometric signals.
+ * Let:
  *
- * Formal definition:
+ *   A = Action
+ *   E = Evidence (snapshot)
+ *   C = Constraints (security + policies)
  *
- *   Output = f(A, E(t), C)
+ * Then:
  *
- * Where:
+ *   Result = f(A, E, C)
  *
- *   A = User Action
- *   E(t) = Evidence captured at time t
- *   C = Constraint set (security + privacy + integrity)
- *
- * -----------------------------------------------------------------------------
- * 📊 PIPELINE (MULTI-LAYER DATAFLOW)
- * -----------------------------------------------------------------------------
- *
- *   USER ACTION
- *       │
- *       ▼
- * ┌───────────────┐
- * │ SESSION CHECK │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ UI GATE       │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ MUTEX         │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ SNAPSHOT      │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ VERIFY        │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ REPLAY GUARD  │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ QUALITY       │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ FACE PIPELINE │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ LIVENESS      │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ MATCHING      │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ DECISION      │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ LEGAL PROOF   │
- * └──────┬────────┘
- *        ▼
- * ┌───────────────┐
- * │ COMMIT        │
- * └───────────────┘
+ * where:
+ *   f is deterministic, side effect controlled, and auditable
  *
  * -----------------------------------------------------------------------------
- * 🔐 SECURITY + PRIVACY INVARIANTS
+ * 📊 PIPELINE GRAPH
  * -----------------------------------------------------------------------------
  *
- * ✅ Replay-safe execution
- * ✅ Rate-limited user boundary
- * ✅ Cryptographically verified inputs
- * ✅ Non-repudiation (legal proof)
- * ✅ No biometric data persistence
+ * USER INPUT
+ *    ↓
+ * SESSION VALIDATION
+ *    ↓
+ * UI RATE LIMIT
+ *    ↓
+ * MUTEX (LINEARIZATION)
+ *    ↓
+ * SNAPSHOT CAPTURE
+ *    ↓
+ * SIGNATURE VERIFICATION
+ *    ↓
+ * REPLAY DEFENSE
+ *    ↓
+ * WAL BEGIN (transaction journaling)
+ *    ↓
+ * IMAGE QUALITY FILTER
+ *    ↓
+ * FACE EXTRACTION
+ *    ↓
+ * LIVENESS ANALYSIS
+ *    ↓
+ * MATCHING
+ *    ↓
+ * DOMAIN DECISION
+ *    ↓
+ * LEGAL PROOF
+ *    ↓
+ * PERSISTENCE
+ *    ↓
+ * WAL COMMIT
  *
  * -----------------------------------------------------------------------------
- * 🔬 KEY PROPERTY
+ * 🔐 CRITICAL INVARIANTS
  * -----------------------------------------------------------------------------
  *
- *   The system is:
- *
- *     Deterministic + Memory-safe + Append-only + Privacy-preserving
+ * ✅ Every execution produces trace
+ * ✅ Every snapshot must be verified
+ * ✅ Every transaction is recorded (WAL)
+ * ✅ No silent failure
  *
  */
 class AttendanceRuntimeOrchestrator(
@@ -139,24 +108,21 @@ class AttendanceRuntimeOrchestrator(
     private val physicalRealityBuilder: PhysicalRealityBuilder,
     private val faceDetector: FaceDetector,
     private val faceNet: MobileFaceNet,
-
     private val livenessOrchestrator: LivenessOrchestrator?,
     private val facialMetricsEngine: FacialMetricsEngine,
-
     private val faceMatchingOrchestrator: FaceMatchingOrchestrator,
     private val attendanceUseCase: AttendanceUseCase,
-
     private val auditTrailWriter: ForensicAuditTrailWriter,
     private val legalEvidenceWriter: LegalEvidenceWriter,
-
+    private val walManager: WalManager,
     val lifecycleManager: AttemptLifecycleManager
 
 ) {
 
     /**
-     * 🔒 Linearizability control
+     * 🔒 Ensures single in-flight transaction (linearizability)
      */
-    private val isProcessing = AtomicBoolean(false)
+    private val isProcessing = AtomicBoolean()
 
     suspend fun attemptAttendance(
         action: AttendanceAction
@@ -168,8 +134,7 @@ class AttendanceRuntimeOrchestrator(
         }
 
         /* ================= UI GATE ================= */
-        val gateResult = AttendanceRequestGate.guard()
-        if (gateResult != null) return gateResult
+        AttendanceRequestGate.guard()?.let { return it }
 
         /* ================= MUTEX ================= */
         if (!isProcessing.compareAndSet(false, true)) {
@@ -178,6 +143,7 @@ class AttendanceRuntimeOrchestrator(
 
         var frame: Bitmap? = null
         var faceBitmap: Bitmap? = null
+        var txId: String? = null
 
         val employeeId = SecureEmployeeSession.requireEmployeeId()
         val timestamp = System.currentTimeMillis()
@@ -197,6 +163,11 @@ class AttendanceRuntimeOrchestrator(
 
             frame = snapshot.payload.frozenFrame
 
+            /**
+             * ✅ FIX: UUID → String
+             */
+            txId = snapshot.snapshotId.toString()
+
             /* ================= VERIFY ================= */
             if (!SnapshotVerifier.verify(snapshot)) {
                 lifecycleManager.markFinal(AttemptStatus.FAILED)
@@ -209,6 +180,12 @@ class AttendanceRuntimeOrchestrator(
                 return blocked("Replay detected")
             }
 
+            /* ================= WAL BEGIN ================= */
+            walManager.begin(
+                id = txId,
+                payloadHash = snapshot.snapshotHash.toString() // ✅ FIX
+            )
+
             /* ================= QUALITY ================= */
             if (!isImageValid(frame)) {
                 lifecycleManager.markFinal(AttemptStatus.FAILED)
@@ -216,8 +193,9 @@ class AttendanceRuntimeOrchestrator(
             }
 
             /* ================= FACE ================= */
-            val detection = faceDetector.detectBestFace(frame)
-                ?: return fail("No face detected")
+            val detection =
+                faceDetector.detectBestFace(frame)
+                    ?: return fail("No face detected")
 
             faceBitmap = FaceCropper.cropAndResize(
                 frame,
@@ -227,17 +205,14 @@ class AttendanceRuntimeOrchestrator(
 
             /* ================= LIVENESS ================= */
             val liveness =
-                handleLiveness(faceBitmap) ?: return fail("Spoof detected")
+                handleLiveness(faceBitmap)
+                    ?: return fail("Spoof detected")
 
             /* ================= MATCHING ================= */
-            val rawEmbedding = faceNet.getEmbedding(faceBitmap)
-
-            /**
-             * 📌 Privacy enforcement:
-             * Embedding is anonymized to reduce reconstruction risk
-             */
             val embedding =
-                EmbeddingAnonymizer.anonymize(rawEmbedding)
+                EmbeddingAnonymizer.anonymize(
+                    faceNet.getEmbedding(faceBitmap)
+                )
 
             val matched =
                 faceMatchingOrchestrator.performMatch(
@@ -260,14 +235,18 @@ class AttendanceRuntimeOrchestrator(
             )
 
             /* ================= LEGAL PROOF ================= */
-            val legalProof = LegalProofGenerator.generate(
-                employeeId,
-                timestamp,
-                result
-            )
+            val legalProof =
+                LegalProofGenerator.generate(
+                    employeeId,
+                    timestamp,
+                    result
+                )
 
             /* ================= COMMIT ================= */
             persistEvidence(snapshot, result, legalProof)
+
+            /* ================= WAL COMMIT ================= */
+            walManager.commit(txId)
 
             lifecycleManager.markFinal(AttemptStatus.SUCCESS)
 
@@ -281,18 +260,7 @@ class AttendanceRuntimeOrchestrator(
         } finally {
 
             /**
-             * =====================================================================
-             * 🔐 PRIVACY-COMPLIANT MEMORY FINALIZATION
-             * =====================================================================
-             *
-             * Critical invariant:
-             *
-             *   ∀ Bitmap b:
-             *       After use(b) → disposed(b)
-             *
-             * Ensures:
-             *   ✅ no biometric leakage
-             *   ✅ no memory retention
+             * 🔐 Memory sanitization (biometric privacy invariant)
              */
             BiometricPrivacyGuard.secureDispose(faceBitmap)
             BiometricPrivacyGuard.secureDispose(frame)
@@ -315,13 +283,7 @@ class AttendanceRuntimeOrchestrator(
         ImageQualityChecker.checkFrame(frame) == SystemStatus.OK
 
     /**
-     * -----------------------------------------------------------------------------
-     * 🧬 LIVENESS PIPELINE
-     * -----------------------------------------------------------------------------
-     *
-     * Transform:
-     *
-     *   Bitmap → Feature Space → Temporal Evaluation → Decision
+     * 🧬 Converts raw face into liveness decision
      */
     private fun handleLiveness(faceBitmap: Bitmap): Boolean? {
 
@@ -339,19 +301,9 @@ class AttendanceRuntimeOrchestrator(
     }
 
     /**
-     * -----------------------------------------------------------------------------
-     * 🔐 DUAL-CHANNEL PERSISTENCE
-     * -----------------------------------------------------------------------------
-     *
-     * Separates:
-     *
-     *   1. Forensic evidence (system audit)
-     *   2. Legal proof (non-repudiation)
-     *
-     * -----------------------------------------------------------------------------
-     * FLOW:
-     *
-     *   Input  → Normalize → Split → Persist
+     * 🔐 Dual persistence:
+     *   - forensic (audit trail)
+     *   - legal (non-repudiation)
      */
     private suspend fun persistEvidence(
         snapshot: SignedPhysicalRealitySnapshot,

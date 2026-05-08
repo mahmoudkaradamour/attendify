@@ -22,87 +22,43 @@ import com.mahmoud.attendify.security.HardwareBackedKeyManager
 
 /**
  * =============================================================================
- * 🔬 PhysicalRealityBuilder — Deterministic Reality Binding Engine
+ * 🧠 PhysicalRealityBuilder — Cryptographic Reality Encoder
  * =============================================================================
  *
  * -----------------------------------------------------------------------------
- * 🧠 ABSTRACT MODEL
+ * 🧠 CORE IDEA
  * -----------------------------------------------------------------------------
  *
- * This component implements a **deterministic, cryptographically bound representation
- * of physical reality at a single moment in time**.
+ * This class transforms real-world signals into an immutable cryptographic proof:
  *
- * Formally, it constructs:
- *
- *   R(t) → P → H → Sign(H)
- *
- * Where:
- *
- *   R(t)  = Physical reality at time t
- *   P     = Canonical binary representation (deterministic)
- *   H     = SHA-256(P)
- *   Sign  = Hardware-backed signature
+ *   Reality → CanonicalBytes → Hash → Signature
  *
  * -----------------------------------------------------------------------------
- * 🔐 SECURITY PROPERTIES
+ * 📊 DATAFLOW
  * -----------------------------------------------------------------------------
  *
- * 1. Temporal Consistency:
- *    - Capture order prevents TOCTOU (Time-of-check vs Time-of-use)
- *
- * 2. Deterministic Encoding:
- *    - Identical input → identical byte stream → identical hash
- *
- * 3. Cryptographic Binding:
- *    - Any bit modification breaks SHA-256 → invalid signature
- *
- * 4. Hardware Trust:
- *    - Signature bound to Keystore (TEE / StrongBox)
- *
- * -----------------------------------------------------------------------------
- * 📊 PIPELINE DIAGRAM
- * -----------------------------------------------------------------------------
- *
- *   ┌──────────────┐
- *   │ GPS Fix      │
- *   └──────┬───────┘
- *          │
- *          ▼
- *   ┌──────────────┐
- *   │ Camera Frame │
- *   └──────┬───────┘
- *          │
- *          ▼
- *   ┌──────────────┐
- *   │ Time Snapshot│
- *   └──────┬───────┘
- *          │
- *          ▼
- *   ┌────────────────────────────┐
- *   │ Canonical Payload Builder │
- *   │ (image + time + location) │
- *   └──────────────┬────────────┘
- *                  ▼
- *             SHA-256 Hash
- *                  ▼
- *         Hardware Signature
- *                  ▼
- *   SignedPhysicalRealitySnapshot ✅
+ * Location (fresh)
+ *    ↓
+ * Frame Capture
+ *    ↓
+ * Time Snapshot
+ *    ↓
+ * Canonical Encoding
+ *    ↓
+ * SHA‑256 Hash
+ *    ↓
+ * Hardware Signature
+ *    ↓
+ * Signed Snapshot ✅
  *
  * -----------------------------------------------------------------------------
- * ⚠️ CRITICAL DESIGN DECISION
+ * 🔐 KEY PROPERTIES
  * -----------------------------------------------------------------------------
  *
- * The payload MUST:
- * ✅ Be deterministic
- * ✅ Have fixed ordering
- * ✅ Avoid encoding ambiguity
- * ✅ Be independent from runtime string formatting
- *
- * This prevents:
- * ❌ Serialization attacks
- * ❌ Data reordering attacks
- * ❌ Encoding inconsistencies
+ * ✅ Deterministic encoding
+ * ✅ Full data binding (image + time + location)
+ * ✅ Tamper-evident output
+ * ✅ Hardware-backed authenticity
  *
  */
 class PhysicalRealityBuilder(
@@ -111,20 +67,8 @@ class PhysicalRealityBuilder(
 ) {
 
     /* =========================================================================
-     * 🧮 PRIMITIVE ENCODING (DETERMINISTIC BINARY FORM)
-     * =========================================================================
-     *
-     * PURPOSE:
-     * Convert high-level data types into fixed, deterministic byte sequences.
-     *
-     * Key idea:
-     *   Every primitive → fixed-size binary representation
-     *
-     * This avoids:
-     * - Locale issues
-     * - String formatting instability
-     * - Platform differences
-     */
+     * 🧮 CANONICAL PRIMITIVES
+     * ========================================================================= */
 
     private fun longToBytes(v: Long) =
         ByteBuffer.allocate(8).putLong(v).array()
@@ -142,30 +86,16 @@ class PhysicalRealityBuilder(
             .putInt(java.lang.Float.floatToIntBits(v))
             .array()
 
-    private fun booleanToByte(v: Boolean) =
+    private fun booleanToBytes(v: Boolean) =
         byteArrayOf(if (v) 1 else 0)
 
-    /**
-     * -----------------------------------------------------------------------------
-     * 🔤 STRING CANONICALIZATION
-     * -----------------------------------------------------------------------------
-     *
-     * Format:
-     *   [length:4 bytes][UTF-8 bytes]
-     *
-     * Why?
-     *   Prevents concatenation ambiguity:
-     *
-     *   "ab"+"cd" != "abc"+"d"
-     *
-     */
     private fun stringToBytes(value: String): ByteArray {
         val raw = value.toByteArray(Charsets.UTF_8)
         return intToBytes(raw.size) + raw
     }
 
     /* =========================================================================
-     * ⏱ TIME SERIALIZATION
+     * ⏱ TIME
      * ========================================================================= */
 
     private fun TimeSnapshot.toCanonicalBytes(): ByteArray {
@@ -177,7 +107,7 @@ class PhysicalRealityBuilder(
     }
 
     /* =========================================================================
-     * 📍 LOCATION SERIALIZATION
+     * 📍 LOCATION
      * ========================================================================= */
 
     private fun LocationEvidence.toCanonicalBytes(): ByteArray {
@@ -190,96 +120,60 @@ class PhysicalRealityBuilder(
                 doubleToBytes(lon) +
                 floatToBytes(acc) +
                 stringToBytes(provider) +
-                booleanToByte(isMockDetected) +
-                booleanToByte(isStale) +
-                booleanToByte(teleportDetected) +
+                booleanToBytes(isMockDetected) +
+                booleanToBytes(isStale) +
+                booleanToBytes(teleportDetected) +
                 doubleToBytes(distanceToAllowedZoneMeters ?: Double.NaN) +
                 stringToBytes(zoneDecision?.policy?.name ?: "NONE") +
                 stringToBytes(policyDecision.name) +
-                booleanToByte(justificationRequired) +
+                booleanToBytes(justificationRequired) +
                 stringToBytes(networkContext.toString()) +
                 longToBytes(timestampMillis)
     }
 
     /* =========================================================================
-     * 🖼 IMAGE HASHING
-     * =========================================================================
-     *
-     * Converts bitmap → deterministic PNG → SHA-256
-     *
-     * Rationale:
-     *   Raw Bitmap memory representation is NOT stable across devices.
-     *
-     * PNG ensures:
-     * ✅ deterministic byte output
-     * ✅ lossless encoding
-     */
+     * 🖼 IMAGE HASH (DETERMINISTIC)
+     * ========================================================================= */
+
     private fun hashBitmap(bitmap: android.graphics.Bitmap): ByteArray {
 
-        val imageBytes = ByteArrayOutputStream().use { output ->
-            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output)
-            output.toByteArray()
+        val bytes = ByteArrayOutputStream().use {
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+            it.toByteArray()
         }
 
-        return MessageDigest
-            .getInstance("SHA-256")
-            .digest(imageBytes)
+        return MessageDigest.getInstance("SHA-256").digest(bytes)
     }
 
     /* =========================================================================
-     * 🚀 MAIN PIPELINE
+     * 🚀 PIPELINE
      * ========================================================================= */
 
     suspend fun buildSignedOrFail(
         timeoutMs: Long
     ): Result<SignedPhysicalRealitySnapshot> = withContext(Dispatchers.IO) {
 
-        /**
-         * ---------------------------------------------------------------------
-         * STEP 1 — LOCATION FIRST (ANCHOR)
-         * ---------------------------------------------------------------------
-         *
-         * Guarantees:
-         * - fresh GPS
-         * - prevents replay of cached location
-         */
+        /* ================= LOCATION ================= */
         val locationResult =
             locationIntegrityGuard.awaitFreshLocation(timeoutMs)
 
         if (locationResult !is LocationIntegrityResult.Allowed) {
             return@withContext Result.failure(
-                IllegalStateException("Location integrity failed")
+                IllegalStateException("Location failed")
             )
         }
 
-        /**
-         * ---------------------------------------------------------------------
-         * STEP 2 — FRAME CAPTURE
-         * ---------------------------------------------------------------------
-         *
-         * Must occur AFTER location to maintain temporal ordering.
-         */
+        /* ================= FRAME ================= */
         val frame = cameraManager.captureSingleFrameSuspend(timeoutMs)
             ?: return@withContext Result.failure(
-                IllegalStateException("Camera capture failed")
+                IllegalStateException("Camera failed")
             )
 
         try {
 
-            /**
-             * -----------------------------------------------------------------
-             * STEP 3 — TIME SNAPSHOT
-             * -----------------------------------------------------------------
-             *
-             * Captured after frame to bind them in same execution window.
-             */
+            /* ================= TIME ================= */
             val timeSnapshot = TimeSource.snapshot()
 
-            /**
-             * -----------------------------------------------------------------
-             * STEP 4 — RAW SNAPSHOT
-             * -----------------------------------------------------------------
-             */
             val snapshot = PhysicalRealitySnapshot(
                 frozenFrame = frame,
                 timeSnapshot = timeSnapshot,
@@ -289,22 +183,8 @@ class PhysicalRealityBuilder(
             val snapshotId = UUID.randomUUID()
             val createdAt = System.currentTimeMillis()
 
-            /**
-             * -----------------------------------------------------------------
-             * STEP 5 — CANONICAL PAYLOAD CONSTRUCTION
-             * -----------------------------------------------------------------
-             *
-             * Structure:
-             *
-             *   [len][imageHash]
-             *   [len][timeBytes]
-             *   [len][locationBytes]
-             *
-             * This ensures:
-             * ✅ Deterministic structure
-             * ✅ Fully reconstructible schema
-             * ✅ Attack-resistant encoding
-             */
+            /* ================= CANONICAL PAYLOAD ================= */
+
             val imageHash = hashBitmap(frame)
             val timeBytes = timeSnapshot.toCanonicalBytes()
             val locationBytes = locationResult.evidence.toCanonicalBytes()
@@ -314,32 +194,22 @@ class PhysicalRealityBuilder(
                         intToBytes(timeBytes.size) + timeBytes +
                         intToBytes(locationBytes.size) + locationBytes
 
-            /**
-             * -----------------------------------------------------------------
-             * STEP 6 — HASH
-             * -----------------------------------------------------------------
-             */
-            val payloadHash = MessageDigest
-                .getInstance("SHA-256")
-                .digest(payload)
+            /* ================= HASH ================= */
 
-            /**
-             * -----------------------------------------------------------------
-             * STEP 7 — HARDWARE SIGN
-             * -----------------------------------------------------------------
-             */
+            val snapshotHash =
+                MessageDigest.getInstance("SHA-256").digest(payload)
+
+            /* ================= SIGN ================= */
+
             val signature =
-                HardwareBackedSnapshotSigner.sign(payloadHash)
+                HardwareBackedSnapshotSigner.sign(snapshotHash)
 
             val certificateChain =
                 HardwareBackedKeyManager.getCertificateChain()
                     .map { it.encoded }
 
-            /**
-             * -----------------------------------------------------------------
-             * STEP 8 — FINAL OUTPUT
-             * -----------------------------------------------------------------
-             */
+            /* ================= FINAL OUTPUT ================= */
+
             return@withContext Result.success(
                 SignedPhysicalRealitySnapshot(
                     snapshotId = snapshotId,
@@ -347,18 +217,13 @@ class PhysicalRealityBuilder(
                     payload = snapshot,
                     signature = signature,
                     certificateChain = certificateChain,
-                    snapshotHash = payloadHash
+                    snapshotHash = snapshotHash // ✅ IMPORTANT FIX
                 )
             )
 
         } catch (t: Throwable) {
 
-            /**
-             * IMPORTANT:
-             * Prevent memory leaks caused by retained bitmaps
-             */
             frame.recycle()
-
             return@withContext Result.failure(t)
         }
     }

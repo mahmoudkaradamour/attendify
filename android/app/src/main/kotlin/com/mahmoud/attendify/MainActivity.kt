@@ -11,132 +11,92 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.*
 
-/* ============================================================================
- * CAMERA & SYSTEM
- * ========================================================================== */
+/* ============================================================================ */
 import com.mahmoud.attendify.camera.CameraManager
 import com.mahmoud.attendify.camera.SystemStatusReporter
-
-/* ============================================================================
- * ORCHESTRATION
- * ========================================================================== */
+/* ============================================================================ */
 import com.mahmoud.attendify.orchestration.AttendanceRuntimeOrchestrator
 import com.mahmoud.attendify.orchestration.PhysicalRealityBuilder
-
-/* ============================================================================
- * DOMAIN
- * ========================================================================== */
+/* ============================================================================ */
 import com.mahmoud.attendify.attendance.usecase.AttendanceUseCase
-
-/* ============================================================================
- * BIOMETRICS
- * ========================================================================== */
-import com.mahmoud.attendify.face.FaceDetector
-import com.mahmoud.attendify.face.MobileFaceNet
-import com.mahmoud.attendify.matching.FaceMatchingOrchestrator
+/* ============================================================================ */
+import com.mahmoud.attendify.face.*
+import com.mahmoud.attendify.matching.*
 import com.mahmoud.attendify.repository.local.LocalEncryptedEmployeeReferenceRepository
-import com.mahmoud.attendify.policy.MatchingPolicy
-import com.mahmoud.attendify.policy.ReferenceAccessPolicy
-import com.mahmoud.attendify.policy.ReferenceValidationPolicy
+import com.mahmoud.attendify.policy.*
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
-
-/* ============================================================================
- * TIME & LOCATION
- * ========================================================================== */
+/* ============================================================================ */
 import com.mahmoud.attendify.system.time.*
 import com.mahmoud.attendify.system.location.*
 import com.mahmoud.attendify.system.time.working.*
-
-/* ============================================================================
- * FORENSICS
- * ========================================================================== */
+/* ============================================================================ */
 import com.mahmoud.attendify.forensics.*
 import com.mahmoud.attendify.forensics.repository.ForensicAuditRepository
 import com.mahmoud.attendify.forensics.db.*
-
-/* ============================================================================
- * SECURITY
- * ========================================================================== */
-import com.mahmoud.attendify.security.ReplayProtectionGuard
+import com.mahmoud.attendify.forensics.wal.WalManager
+/* ============================================================================ */
+import com.mahmoud.attendify.security.*
 import com.mahmoud.attendify.security.legal.LegalEvidenceWriter
-
-/* ============================================================================
- * RECOVERY
- * ========================================================================== */
+/* ============================================================================ */
 import com.mahmoud.attendify.storage.recovery.AttemptRecoveryManager
-
-/* ============================================================================
- * CONFIG + CHANNEL
- * ========================================================================== */
+/* ============================================================================ */
 import com.mahmoud.attendify.attendance.config.AttendancePolicyProvider
 import com.mahmoud.attendify.channel.AttendanceMethodChannel
 
 /**
  * =============================================================================
- * 🛡 MainActivity — System Composition Root (Deterministic Assembly Layer)
+ * 🧠 MainActivity — System Composition Root
  * =============================================================================
  *
  * -----------------------------------------------------------------------------
- * 🧠 ROLE (ARCHITECTURAL)
+ * 🧠 ARCHITECTURAL ROLE
  * -----------------------------------------------------------------------------
  *
- * This class represents the **Composition Root** of the system.
+ * This class is the **only place where objects are constructed**.
  *
- * It is responsible for:
+ * It defines:
  *
- *   ✔ Dependency Graph Construction
- *   ✔ System Initialization (Bootstrapping)
- *   ✔ Wiring execution pipeline
- *
- * It MUST NOT contain:
- *
- *   ✖ Business logic
- *   ✖ Security decisions
- *   ✖ Biometric processing
+ *   ✅ Object graph (Dependency Injection without framework)
+ *   ✅ System startup sequence
+ *   ✅ Execution pipeline wiring
  *
  * -----------------------------------------------------------------------------
- * 🧠 TRUST MODEL
+ * 📊 SYSTEM INITIALIZATION FLOW
  * -----------------------------------------------------------------------------
  *
- *   UI Layer (Flutter) → UNTRUSTED INPUT
- *   MainActivity        → CONFIGURATION ONLY
- *   Orchestrator        → TRUST AUTHORITY
+ *   App Start
+ *       │
+ *       ▼
+ *   Initialize Context
+ *       │
+ *       ▼
+ *   Initialize Security Guards
+ *       │
+ *       ▼
+ *   Initialize WAL (transaction log)
+ *       │
+ *       ▼
+ *   Initialize Forensic Ledger
+ *       │
+ *       ▼
+ *   Verify Integrity Chain
+ *       │
+ *       ▼
+ *   Build Runtime Orchestrator
+ *       │
+ *       ▼
+ *   Recovery Check
+ *       │
+ *       ▼
+ *   Start Camera Preview
  *
  * -----------------------------------------------------------------------------
- * 📊 SYSTEM STARTUP FLOW
+ * 🔐 SECURITY MODEL
  * -----------------------------------------------------------------------------
  *
- *   App Launch
- *       │
- *       ▼
- *   Initialize global context
- *       │
- *       ▼
- *   Initialize security guards
- *       │
- *       ▼
- *   Load persistent forensic ledger
- *       │
- *       ▼
- *   Verify chain integrity
- *       │
- *       ▼
- *   Build full runtime pipeline
- *       │
- *       ▼
- *   Run recovery checks
- *       │
- *       ▼
- *   Start camera preview
- *
- * -----------------------------------------------------------------------------
- * 🔐 SECURITY GUARANTEES
- * -----------------------------------------------------------------------------
- *
- * ✅ Replay protection initialized before any action
- * ✅ Persistent ledger verified on startup
- * ✅ Abnormal shutdowns detected (recovery layer)
- * ✅ Dependency graph cannot be altered at runtime
+ * UI Layer  → UNTRUSTED
+ * Activity  → CONFIGURATION ONLY
+ * Core      → TRUSTED EXECUTION ENGINE
  *
  */
 class MainActivity : FlutterActivity() {
@@ -149,26 +109,38 @@ class MainActivity : FlutterActivity() {
         super.onCreate(savedInstanceState)
 
         /* ================================================================
-         * 🧠 GLOBAL CONTEXT INITIALIZATION
+         * 🧠 GLOBAL CONTEXT
          * ================================================================ */
         com.mahmoud.attendify.app.AppContextProvider
             .initialize(applicationContext)
 
         /* ================================================================
-         * 🔐 REPLAY PROTECTION (EARLY INIT)
+         * 🔐 REPLAY PROTECTION
          * ================================================================ */
-        ReplayProtectionGuard.initialize {
-            applicationContext
-        }
+        ReplayProtectionGuard.initialize { applicationContext }
 
         /* ================================================================
-         * 🎥 UI LAYER (STRICTLY PASSIVE)
+         * 🧾 WAL MANAGER (TRANSACTION JOURNAL)
+         * ================================================================ */
+        val walManager = WalManager()
+
+        /**
+         * WAL guarantees:
+         *
+         *   BEGIN → PROCESS → COMMIT
+         *
+         * If the system crashes:
+         *   → WAL reveals incomplete transaction
+         */
+
+        /* ================================================================
+         * 🎥 UI LAYER
          * ================================================================ */
         previewView = PreviewView(this)
         setContentView(previewView)
 
         /* ================================================================
-         * 📸 CAMERA LAYER (HARDWARE ACCESS ONLY)
+         * 📸 CAMERA
          * ================================================================ */
         cameraManager = CameraManager(
             context = this,
@@ -177,7 +149,7 @@ class MainActivity : FlutterActivity() {
         )
 
         /* ================================================================
-         * 🗄 PERSISTENT FORENSIC LEDGER (D1)
+         * 🗄 FORENSIC LEDGER
          * ================================================================ */
         val db = androidx.room.Room.databaseBuilder(
             applicationContext,
@@ -189,7 +161,7 @@ class MainActivity : FlutterActivity() {
         val auditWriter = ForensicAuditTrailWriter(repository)
 
         /* ================================================================
-         * 🔐 ANTI-TAMPER CHAIN VERIFICATION (D2)
+         * 🔐 CHAIN VERIFICATION
          * ================================================================ */
         CoroutineScope(Dispatchers.IO).launch {
 
@@ -197,28 +169,29 @@ class MainActivity : FlutterActivity() {
 
             if (!valid) {
                 auditWriter.appendSystemEvent(
-                    event = "LEDGER_TAMPER_DETECTED",
-                    details = "Forensic chain integrity violation"
+                    "LEDGER_TAMPER_DETECTED",
+                    "Integrity chain broken"
                 )
             }
         }
 
         /* ================================================================
-         * 🧾 LEGAL EVIDENCE WRITER (SEPARATE CHANNEL)
+         * ⚖️ LEGAL LAYER
          * ================================================================ */
         val legalEvidenceWriter = LegalEvidenceWriter()
 
         /* ================================================================
-         * 🧠 BUILD FULL RUNTIME ENGINE
+         * 🧠 ORCHESTRATOR CONSTRUCTION
          * ================================================================ */
         orchestrator = buildAttendanceRuntime(
             cameraManager,
             auditWriter,
-            legalEvidenceWriter
+            legalEvidenceWriter,
+            walManager
         )
 
         /* ================================================================
-         * 🧯 RECOVERY SYSTEM (ANTI-SILENT-FAILURE)
+         * 🧯 RECOVERY SYSTEM
          * ================================================================ */
         val recoveryManager = AttemptRecoveryManager(
             lifecycleManager = orchestrator.lifecycleManager,
@@ -263,9 +236,6 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /**
-     * Camera preview ONLY — no capture logic allowed here
-     */
     private fun startCameraPreview() {
         cameraManager.startCamera(
             preview = previewView.surfaceProvider
@@ -273,13 +243,14 @@ class MainActivity : FlutterActivity() {
     }
 
     /* =========================================================================
-     * 🧠 COMPOSITION ROOT — FULL DEPENDENCY GRAPH
+     * 🧠 DEPENDENCY GRAPH CONSTRUCTION
      * ========================================================================= */
 
     private fun buildAttendanceRuntime(
         cameraManager: CameraManager,
         auditWriter: ForensicAuditTrailWriter,
-        legalEvidenceWriter: LegalEvidenceWriter
+        legalEvidenceWriter: LegalEvidenceWriter,
+        walManager: WalManager
     ): AttendanceRuntimeOrchestrator {
 
         /* ---------------- BIOMETRICS ---------------- */
@@ -332,19 +303,17 @@ class MainActivity : FlutterActivity() {
                     )
             )
 
-        /* ---------------- REALITY BUILDER ---------------- */
         val physicalRealityBuilder =
             PhysicalRealityBuilder(
-                cameraManager = cameraManager,
-                locationIntegrityGuard = locationIntegrityGuard
+                cameraManager,
+                locationIntegrityGuard
             )
 
-        /* ---------------- LIFECYCLE ---------------- */
         val lifecycleManager =
             com.mahmoud.attendify.attendance.lifecycle
                 .AttemptLifecycleManager(applicationContext)
 
-        /* ---------------- ORCHESTRATOR ---------------- */
+        /* ---------------- FINAL ENGINE ---------------- */
         return AttendanceRuntimeOrchestrator(
             physicalRealityBuilder = physicalRealityBuilder,
             faceDetector = faceDetector,
@@ -355,6 +324,7 @@ class MainActivity : FlutterActivity() {
             attendanceUseCase = attendanceUseCase,
             auditTrailWriter = auditWriter,
             legalEvidenceWriter = legalEvidenceWriter,
+            walManager = walManager, // ✅ FIX
             lifecycleManager = lifecycleManager
         )
     }
