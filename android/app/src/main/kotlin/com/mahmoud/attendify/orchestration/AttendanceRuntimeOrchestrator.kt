@@ -1,6 +1,8 @@
 package com.mahmoud.attendify.orchestration
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.provider.Settings
 import java.util.concurrent.atomic.AtomicBoolean
 
 /* ============================================================================ */
@@ -26,9 +28,9 @@ import com.mahmoud.attendify.security.boundary.AttendanceRequestGate
 import com.mahmoud.attendify.security.boundary.SessionIntegrityGuard
 import com.mahmoud.attendify.security.legal.*
 import com.mahmoud.attendify.security.privacy.*
-import com.mahmoud.attendify.forensics.wal.WalManager
 /* ============================================================================ */
 import com.mahmoud.attendify.forensics.*
+import com.mahmoud.attendify.forensics.wal.WalManager
 import com.mahmoud.attendify.forensics.integrity.SnapshotVerifier
 /* ============================================================================ */
 import com.mahmoud.attendify.attendance.lifecycle.*
@@ -37,73 +39,109 @@ import kotlinx.coroutines.withContext
 
 /**
  * =============================================================================
- * 🧠 AttendanceRuntimeOrchestrator — Transactional Biometric Execution Engine
+ * 🧠 AttendanceRuntimeOrchestrator — Formal Transaction Execution Engine
  * =============================================================================
  *
  * -----------------------------------------------------------------------------
- * 🧠 FORMAL EXECUTION MODEL
+ * 🧠 ABSTRACT MODEL (MATHEMATICAL FORMULATION)
  * -----------------------------------------------------------------------------
  *
  * Let:
  *
- *   A = Action
- *   E = Evidence (snapshot)
- *   C = Constraints (security + policies)
+ *   A = User Action
+ *   E = Evidence (Snapshot)
+ *   C = Constraints (Security, Environment, Policies)
  *
  * Then:
  *
  *   Result = f(A, E, C)
  *
  * where:
- *   f is deterministic, side effect controlled, and auditable
+ *
+ *   f : deterministic function
+ *
+ *   Properties:
+ *     - Pure with respect to inputs
+ *     - Side-effects are controlled and logged
+ *     - Fully auditable
  *
  * -----------------------------------------------------------------------------
- * 📊 PIPELINE GRAPH
+ * 📊 SYSTEM EXECUTION GRAPH (CONTROL FLOW)
  * -----------------------------------------------------------------------------
  *
- * USER INPUT
- *    ↓
- * SESSION VALIDATION
- *    ↓
- * UI RATE LIMIT
- *    ↓
- * MUTEX (LINEARIZATION)
- *    ↓
- * SNAPSHOT CAPTURE
- *    ↓
- * SIGNATURE VERIFICATION
- *    ↓
- * REPLAY DEFENSE
- *    ↓
- * WAL BEGIN (transaction journaling)
- *    ↓
- * IMAGE QUALITY FILTER
- *    ↓
- * FACE EXTRACTION
- *    ↓
- * LIVENESS ANALYSIS
- *    ↓
- * MATCHING
- *    ↓
- * DOMAIN DECISION
- *    ↓
- * LEGAL PROOF
- *    ↓
- * PERSISTENCE
- *    ↓
- * WAL COMMIT
+ *   User Input
+ *        │
+ *        ▼
+ *   Session Validation
+ *        │
+ *        ▼
+ *   Request Gate (Rate Limiting)
+ *        │
+ *        ▼
+ *   Atomic Lock (Linearization)
+ *        │
+ *        ▼
+ *   Physical Snapshot Capture
+ *        │
+ *        ▼
+ *   Cryptographic Verification
+ *        │
+ *        ▼
+ *   Replay Protection
+ *        │
+ *        ▼
+ *   WAL Begin (Pre-commit logging)
+ *        │
+ *        ▼
+ *   Environment Validation (Security Signals)
+ *        │
+ *        ▼
+ *   Image Quality Check
+ *        │
+ *        ▼
+ *   Face Detection & Extraction
+ *        │
+ *        ▼
+ *   Liveness Analysis
+ *        │
+ *        ▼
+ *   Face Matching
+ *        │
+ *        ▼
+ *   Decision Execution
+ *        │
+ *        ▼
+ *   Legal Evidence Generation
+ *        │
+ *        ▼
+ *   NonCancellable Persistence (Atomic Commit)
+ *        │
+ *        ▼
+ *   WAL Commit
  *
  * -----------------------------------------------------------------------------
- * 🔐 CRITICAL INVARIANTS
+ * 🔐 CRITICAL INVARIANTS (SYSTEM SAFETY PROPERTIES)
  * -----------------------------------------------------------------------------
  *
- * ✅ Every execution produces trace
- * ✅ Every snapshot must be verified
- * ✅ Every transaction is recorded (WAL)
- * ✅ No silent failure
+ * 1. ∀ T : Transaction:
+ *      BEGIN(T) happens-before COMMIT(T)
+ *
+ * 2. ∀ Evidence:
+ *      Verified(E) = true before usage
+ *
+ * 3. ∄ Silent Execution:
+ *      Every execution produces forensic trace
+ *
+ * 4. ∄ Partial Commit:
+ *      Persistence ∈ NonCancellable region
+ *
+ * 5. ∄ Concurrent Execution:
+ *      AtomicBoolean guarantees linearizability
  *
  */
 class AttendanceRuntimeOrchestrator(
+
+    private val context: Context,
 
     private val physicalRealityBuilder: PhysicalRealityBuilder,
     private val faceDetector: FaceDetector,
@@ -120,30 +158,55 @@ class AttendanceRuntimeOrchestrator(
 ) {
 
     /**
-     * 🔒 Ensures single in-flight transaction (linearizability)
+     * -----------------------------------------------------------------------------
+     * 🔒 LINEARIZATION MECHANISM
+     * -----------------------------------------------------------------------------
+     *
+     * Guarantees:
+     *   Only one transaction executes at any given time.
+     *
+     * Formally:
+     *   ∀ T1, T2:
+     *     T1 || T2 cannot overlap
+     *
      */
-    private val isProcessing = AtomicBoolean()
+    private val isProcessing = AtomicBoolean(false)
 
+    /**
+     * =============================================================================
+     * 🚀 attemptAttendance — MAIN ENTRY POINT
+     * =============================================================================
+     *
+     * Executes full transactional pipeline.
+     *
+     * -----------------------------------------------------------------------------
+     * 🧠 EXECUTION SEMANTICS
+     * -----------------------------------------------------------------------------
+     *
+     * This function transforms untrusted input into:
+     *
+     *   → Verified, Signed, Auditable Result
+     *
+     */
     suspend fun attemptAttendance(
         action: AttendanceAction
     ): AttendanceResult {
 
-        /* ================= SESSION ================= */
+        /* ================= SESSION VALIDATION ================= */
         if (!SessionIntegrityGuard.validate()) {
             return AttendanceResult.Blocked("Session invalid")
         }
 
-        /* ================= UI GATE ================= */
+        /* ================= RATE LIMIT ================= */
         AttendanceRequestGate.guard()?.let { return it }
 
         /* ================= MUTEX ================= */
         if (!isProcessing.compareAndSet(false, true)) {
-            return blocked("Attendance already in progress")
+            return blocked("Concurrent execution not allowed")
         }
 
         var frame: Bitmap? = null
         var faceBitmap: Bitmap? = null
-        var txId: String? = null
 
         val employeeId = SecureEmployeeSession.requireEmployeeId()
         val timestamp = System.currentTimeMillis()
@@ -158,52 +221,71 @@ class AttendanceRuntimeOrchestrator(
                 .buildSignedOrFail(2000)
                 .getOrElse {
                     lifecycleManager.markFinal(AttemptStatus.FAILED)
-                    return blocked("Snapshot failed")
+                    return blocked("Snapshot failure")
                 }
 
             frame = snapshot.payload.frozenFrame
+            val txId = snapshot.snapshotId.toString()
 
-            /**
-             * ✅ FIX: UUID → String
-             */
-            txId = snapshot.snapshotId.toString()
-
-            /* ================= VERIFY ================= */
+            /* ================= CRYPTOGRAPHIC VERIFICATION ================= */
             if (!SnapshotVerifier.verify(snapshot)) {
                 lifecycleManager.markFinal(AttemptStatus.FAILED)
                 return blocked("Invalid snapshot")
             }
 
-            /* ================= REPLAY ================= */
+            /* ================= REPLAY DEFENSE ================= */
             if (!ReplayProtectionGuard.registerOrReject(snapshot.snapshotId)) {
                 lifecycleManager.markFinal(AttemptStatus.FAILED)
                 return blocked("Replay detected")
             }
 
             /* ================= WAL BEGIN ================= */
-            walManager.begin(
-                id = txId,
-                payloadHash = snapshot.snapshotHash.toString() // ✅ FIX
+            walManager.begin(txId, snapshot.snapshotHash.toString())
+
+            /**
+             * ---------------------------------------------------------------------
+             * 🔐 SECURITY CONTEXT CAPTURE
+             * ---------------------------------------------------------------------
+             *
+             * Captures environment signals that may indicate compromise:
+             *
+             *   - Accessibility Services (automation risk)
+             *   - USB Debugging (external control channel)
+             */
+            val accessibilityEnabled = Settings.Secure.getInt(
+                context.contentResolver,
+                Settings.Secure.ACCESSIBILITY_ENABLED, 0
+            ) == 1
+
+            val usbDebuggingEnabled = Settings.Global.getInt(
+                context.contentResolver,
+                Settings.Global.ADB_ENABLED, 0
+            ) == 1
+
+            auditTrailWriter.appendSystemEvent(
+                "SECURITY_CONTEXT",
+                "accessibility=$accessibilityEnabled, adb=$usbDebuggingEnabled"
             )
 
-            /* ================= QUALITY ================= */
+            /* ================= IMAGE QUALITY ================= */
             if (!isImageValid(frame)) {
                 lifecycleManager.markFinal(AttemptStatus.FAILED)
-                return blocked("Bad image quality")
+                return blocked("Poor image quality")
             }
 
-            /* ================= FACE ================= */
+            /* ================= FACE DETECTION ================= */
             val detection =
                 faceDetector.detectBestFace(frame)
-                    ?: return fail("No face detected")
+                    ?: return fail("Face not detected")
 
+            /* ================= FACE EXTRACTION ================= */
             faceBitmap = FaceCropper.cropAndResize(
                 frame,
                 detection.box,
                 112
-            ) ?: return fail("Face crop failed")
+            ) ?: return fail("Face extraction failed")
 
-            /* ================= LIVENESS ================= */
+            /* ================= LIVENESS ANALYSIS ================= */
             val liveness =
                 handleLiveness(faceBitmap)
                     ?: return fail("Spoof detected")
@@ -221,9 +303,9 @@ class AttendanceRuntimeOrchestrator(
                     null
                 ) is MatchDecision.MatchSuccess
 
-            if (!matched) return fail("Face mismatch")
+            if (!matched) return fail("Identity mismatch")
 
-            /* ================= DECISION ================= */
+            /* ================= BUSINESS DECISION ================= */
             val result = attendanceUseCase.attempt(
                 action,
                 AttendanceAtomicContext(
@@ -234,7 +316,7 @@ class AttendanceRuntimeOrchestrator(
                 liveness
             )
 
-            /* ================= LEGAL PROOF ================= */
+            /* ================= LEGAL EVIDENCE ================= */
             val legalProof =
                 LegalProofGenerator.generate(
                     employeeId,
@@ -242,14 +324,29 @@ class AttendanceRuntimeOrchestrator(
                     result
                 )
 
-            /* ================= COMMIT ================= */
-            persistEvidence(snapshot, result, legalProof)
+            /**
+             * ---------------------------------------------------------------------
+             * ✅ ATOMIC COMMIT SECTION (CRITICAL)
+             * ---------------------------------------------------------------------
+             *
+             * This region is NON-CANCELLABLE.
+             *
+             * Guarantees:
+             *   - No interruption after decision
+             *   - No broken forensic chain
+             *
+             * Prevents:
+             *   ❌ Coroutine cancellation attack
+             *   ❌ Partial persistence
+             */
+            withContext(NonCancellable) {
 
-            /* ================= WAL COMMIT ================= */
-            walManager.commit(txId)
+                persistEvidence(snapshot, result, legalProof)
+
+                walManager.commit(txId)
+            }
 
             lifecycleManager.markFinal(AttemptStatus.SUCCESS)
-
             return result
 
         } catch (e: Exception) {
@@ -260,7 +357,14 @@ class AttendanceRuntimeOrchestrator(
         } finally {
 
             /**
-             * 🔐 Memory sanitization (biometric privacy invariant)
+             * ---------------------------------------------------------------------
+             * 🔐 BIOMETRIC DATA SANITIZATION
+             * ---------------------------------------------------------------------
+             *
+             * Ensures:
+             *   - No residual biometric data in memory
+             *   - Privacy preservation
+             *
              */
             BiometricPrivacyGuard.secureDispose(faceBitmap)
             BiometricPrivacyGuard.secureDispose(frame)
@@ -269,7 +373,9 @@ class AttendanceRuntimeOrchestrator(
         }
     }
 
-    /* ========================================================================= */
+    /* =========================================================================
+     * 🧰 HELPER FUNCTIONS
+     * ========================================================================= */
 
     private fun fail(reason: String): AttendanceResult {
         lifecycleManager.markFinal(AttemptStatus.FAILED)
@@ -283,7 +389,18 @@ class AttendanceRuntimeOrchestrator(
         ImageQualityChecker.checkFrame(frame) == SystemStatus.OK
 
     /**
-     * 🧬 Converts raw face into liveness decision
+     * -----------------------------------------------------------------------------
+     * 🧬 LIVENESS EVALUATION PIPELINE
+     * -----------------------------------------------------------------------------
+     *
+     * Pipeline:
+     *
+     *   Bitmap → Metrics → Temporal Analysis → Decision
+     *
+     * Output:
+     *
+     *   null  → spoof
+     *   true  → live human
      */
     private fun handleLiveness(faceBitmap: Bitmap): Boolean? {
 
@@ -301,22 +418,28 @@ class AttendanceRuntimeOrchestrator(
     }
 
     /**
-     * 🔐 Dual persistence:
-     *   - forensic (audit trail)
-     *   - legal (non-repudiation)
+     * -----------------------------------------------------------------------------
+     * 🔐 PERSISTENCE LAYER
+     * -----------------------------------------------------------------------------
+     *
+     * Dual-write model:
+     *
+     *   1. Forensic Evidence (append-only ledger)
+     *   2. Legal Proof (non-repudiation)
+     *
+     * Ensures:
+     *   Integrity + Accountability + Traceability
      */
     private suspend fun persistEvidence(
         snapshot: SignedPhysicalRealitySnapshot,
         result: AttendanceResult,
         legalProof: LegalEvidenceBundle
     ) {
-        withContext(NonCancellable) {
 
-            val evidence =
-                EvidenceNormalizer.normalize(snapshot, result)
+        val evidence =
+            EvidenceNormalizer.normalize(snapshot, result)
 
-            auditTrailWriter.append(evidence)
-            legalEvidenceWriter.append(legalProof)
-        }
+        auditTrailWriter.append(evidence)
+        legalEvidenceWriter.append(legalProof)
     }
 }
