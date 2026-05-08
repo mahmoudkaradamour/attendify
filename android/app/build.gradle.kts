@@ -114,4 +114,7 @@ dependencies {
      * ✅ JSON
      * ========================================================= */
     implementation("org.json:json:20231013")
+
+
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
 }

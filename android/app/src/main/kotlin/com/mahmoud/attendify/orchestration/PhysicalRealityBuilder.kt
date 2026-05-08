@@ -3,10 +3,13 @@ package com.mahmoud.attendify.orchestration
 import java.util.UUID
 import java.security.MessageDigest
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 import kotlin.math.abs
+
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+
+import android.os.SystemClock
+import android.graphics.Bitmap
 
 import com.mahmoud.attendify.camera.CameraManager
 import com.mahmoud.attendify.system.time.TimeSource
@@ -20,60 +23,92 @@ import com.mahmoud.attendify.orchestration.context.SignedPhysicalRealitySnapshot
 
 import com.mahmoud.attendify.security.HardwareBackedSnapshotSigner
 import com.mahmoud.attendify.security.HardwareBackedKeyManager
+import com.mahmoud.attendify.security.canonical.CanonicalSerializer
 
 /**
  * =============================================================================
- * 🧠 PhysicalRealityBuilder — Hardened Reality Binding Engine
+ * 🧠 PhysicalRealityBuilder — Deterministic Reality Binding Engine
  * =============================================================================
  *
  * -----------------------------------------------------------------------------
- * 🧠 FORMAL MODEL
+ * 🧠 FORMAL SYSTEM MODEL
  * -----------------------------------------------------------------------------
  *
  * Let:
  *
- *   R(t)  = physical world state at time t
- *   C     = canonical encoding function
- *   H     = SHA‑256 hash
- *   S     = hardware-backed signature
+ *   R(t) = captured physical reality at time t
+ *   C(.) = canonical encoding function
+ *   H(.) = SHA-256 cryptographic hash
+ *   S(.) = hardware-backed signature
  *
  * Then:
  *
  *   Evidence = S(H(C(R(t))))
  *
  * -----------------------------------------------------------------------------
- * ⚠️ CRITICAL CONSTRAINTS IMPLEMENTED
+ * 🎯 SYSTEM OBJECTIVE
  * -----------------------------------------------------------------------------
  *
- * ✅ Canonical determinism (no floating ambiguity)
- * ✅ Temporal synchronization (≤ 500 ms constraint)
- * ✅ Image binding (hash of pixels)
- * ✅ Hardware-backed authenticity
+ * Convert UNTRUSTED physical inputs (camera + GPS + time)
+ * into a TRUSTED, signed, and verifiable digital artifact.
  *
  * -----------------------------------------------------------------------------
- * 📊 PIPELINE (REALITY → PROOF)
+ * 🔐 CORE SECURITY PROPERTIES
  * -----------------------------------------------------------------------------
  *
- *   Location (fresh + timestamp)
- *        │
- *        ▼
- *   Camera Capture (timestamped)
- *        │
- *        ▼
- *   Temporal Synchronization Check ✅
- *        │
- *        ▼
- *   Canonical Encoding
- *        │
- *        ▼
- *   SHA‑256 Hash
- *        │
- *        ▼
- *   Hardware Signature
- *        │
- *        ▼
- *   Signed Snapshot
+ *   ✅ Temporal coherence  (sensor synchronization)
+ *   ✅ Spatial validity    (accuracy constraint)
+ *   ✅ Canonical determinism (bit-level consistency)
+ *   ✅ Cryptographic integrity (SHA-256)
+ *   ✅ Hardware authenticity (TEE / StrongBox)
  *
+ * -----------------------------------------------------------------------------
+ * 📊 EXECUTION PIPELINE (FULL FLOW)
+ * -----------------------------------------------------------------------------
+ *
+ *   ┌─────────────────────────────┐
+ *   │ Location Acquisition       │
+ *   └────────────┬───────────────┘
+ *                ▼
+ *   ┌─────────────────────────────┐
+ *   │ Camera Frame Capture        │
+ *   └────────────┬───────────────┘
+ *                ▼
+ *   ┌─────────────────────────────┐
+ *   │ Temporal Constraint Check   │
+ *   │ |ΔT| ≤ 500 ms              │
+ *   └────────────┬───────────────┘
+ *                ▼
+ *   ┌─────────────────────────────┐
+ *   │ Canonical Encoding          │
+ *   └────────────┬───────────────┘
+ *                ▼
+ *   ┌─────────────────────────────┐
+ *   │ SHA-256 Hash                │
+ *   └────────────┬───────────────┘
+ *                ▼
+ *   ┌─────────────────────────────┐
+ *   │ Hardware Signature          │
+ *   └────────────┬───────────────┘
+ *                ▼
+ *   ┌─────────────────────────────┐
+ *   │ Signed Evidence Snapshot    │
+ *   └─────────────────────────────┘
+ *
+ * -----------------------------------------------------------------------------
+ * ❗ SYSTEM INVARIANTS (CRITICAL)
+ * -----------------------------------------------------------------------------
+ *
+ * 1. Determinism:
+ *    Same physical input → identical hash
+ *
+ * 2. Freshness:
+ *    No stale or replayed data allowed
+ *
+ * 3. Binding:
+ *    Image + location + time MUST belong to same event
+ *
+ * -----------------------------------------------------------------------------
  */
 class PhysicalRealityBuilder(
     private val cameraManager: CameraManager,
@@ -81,88 +116,69 @@ class PhysicalRealityBuilder(
 ) {
 
     /* =========================================================================
-     * 🧮 CANONICAL PRIMITIVES
+     * ⏱ TIME CANONICALIZATION
      * ========================================================================= */
 
-    private fun longToBytes(v: Long) =
-        ByteBuffer.allocate(8).putLong(v).array()
-
-    private fun intToBytes(v: Int) =
-        ByteBuffer.allocate(4).putInt(v).array()
-
-    private fun floatToBytes(v: Float) =
-        ByteBuffer.allocate(4)
-            .putInt(java.lang.Float.floatToIntBits(v))
-            .array()
-
-    private fun booleanToBytes(v: Boolean) =
-        byteArrayOf(if (v) 1 else 0)
-
-    private fun stringToBytes(value: String): ByteArray {
-        val raw = value.toByteArray(Charsets.UTF_8)
-        return intToBytes(raw.size) + raw
-    }
-
-    /* =========================================================================
-     * ✅ CRITICAL FIX — FLOAT → INTEGER CANONICALIZATION
-     * =========================================================================
+    /**
+     * Converts TimeSnapshot → canonical byte representation.
      *
-     * Floating-point numbers are NOT deterministic across architectures.
-     *
-     * Therefore:
-     *
-     *   lat/lon → scaled integers (1e7 precision)
-     *
-     * This guarantees:
-     *   ✅ deterministic encoding
-     *   ✅ cross-device consistency
+     * Ensures:
+     *   - multi-clock correlation
+     *   - resistance against clock spoofing
      */
-    private fun encodeLatitude(lat: Double?): ByteArray {
-        val value = ((lat ?: 0.0) * 1e7).toLong()
-        return longToBytes(value)
-    }
-
-    private fun encodeLongitude(lon: Double?): ByteArray {
-        val value = ((lon ?: 0.0) * 1e7).toLong()
-        return longToBytes(value)
-    }
-
-    /* =========================================================================
-     * ⏱ TIME ENCODING
-     * ========================================================================= */
-
     private fun TimeSnapshot.toCanonicalBytes(): ByteArray {
-        return longToBytes(wallClockMillis) +
-                longToBytes(elapsedRealtimeMillis) +
-                longToBytes(uptimeMillis) +
-                stringToBytes(bootId) +
-                stringToBytes(timeZoneId)
+        return CanonicalSerializer.longToBytes(wallClockMillis) +
+                CanonicalSerializer.longToBytes(elapsedRealtimeMillis) +
+                CanonicalSerializer.longToBytes(uptimeMillis) +
+                CanonicalSerializer.stringToBytes(bootId) +
+                CanonicalSerializer.stringToBytes(timeZoneId)
     }
 
     /* =========================================================================
-     * 📍 LOCATION ENCODING (HARDENED)
+     * 📍 LOCATION CANONICALIZATION
      * ========================================================================= */
 
+    /**
+     * Converts location evidence into deterministic representation.
+     *
+     * Includes:
+     *   - scaled coordinates
+     *   - accuracy
+     *   - spoofing indicators
+     */
     private fun LocationEvidence.toCanonicalBytes(): ByteArray {
 
-        return encodeLatitude(latitude) +
-                encodeLongitude(longitude) +
-                floatToBytes(accuracyMeters ?: Float.NaN) +
-                stringToBytes(provider) +
-                booleanToBytes(isMockDetected) +
-                booleanToBytes(isStale) +
-                booleanToBytes(teleportDetected) +
-                longToBytes(timestampMillis)
+        return CanonicalSerializer.encodeLatitude(latitude) +
+                CanonicalSerializer.encodeLongitude(longitude) +
+                CanonicalSerializer.floatToBytes(accuracyMeters ?: Float.NaN) +
+                CanonicalSerializer.stringToBytes(provider) +
+                CanonicalSerializer.booleanToBytes(isMockDetected) +
+                CanonicalSerializer.booleanToBytes(isStale) +
+                CanonicalSerializer.booleanToBytes(teleportDetected) +
+                CanonicalSerializer.longToBytes(timestampMillis)
     }
 
     /* =========================================================================
      * 🖼 IMAGE HASHING
      * ========================================================================= */
 
-    private fun hashBitmap(bitmap: android.graphics.Bitmap): ByteArray {
+    /**
+     * Converts bitmap → SHA-256 hash.
+     *
+     * Rationale:
+     *   Image is large and non-deterministic in raw form.
+     *   Hash provides:
+     *     - compact representation
+     *     - tamper detection
+     *
+     * Flow:
+     *
+     *   Bitmap → PNG encoding → ByteArray → SHA-256 → Hash
+     */
+    private fun hashBitmap(bitmap: Bitmap): ByteArray {
 
         val bytes = ByteArrayOutputStream().use { out ->
-            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             out.toByteArray()
         }
 
@@ -170,7 +186,7 @@ class PhysicalRealityBuilder(
     }
 
     /* =========================================================================
-     * 🚀 MAIN PIPELINE
+     * 🚀 MAIN EXECUTION PIPELINE
      * ========================================================================= */
 
     suspend fun buildSignedOrFail(
@@ -178,93 +194,107 @@ class PhysicalRealityBuilder(
     ): Result<SignedPhysicalRealitySnapshot> = withContext(Dispatchers.IO) {
 
         /* ================================================================
-         * STEP 1 — LOCATION (ANCHOR)
+         * STEP 1 — LOCATION ACQUISITION
          * ================================================================ */
+
         val locationResult =
             locationIntegrityGuard.awaitFreshLocation(timeoutMs)
 
         if (locationResult !is LocationIntegrityResult.Allowed) {
             return@withContext Result.failure(
-                IllegalStateException("Location integrity failed")
+                IllegalStateException("Location integrity failure")
             )
         }
 
-        val locationTime = locationResult.evidence.timestampMillis
+        val location = locationResult.evidence
 
         /* ================================================================
-         * STEP 2 — CAMERA FRAME (REAL-TIME)
+         * STEP 2 — CAMERA CAPTURE (MONOTONIC TIME)
          * ================================================================ */
-        val captureStart = System.currentTimeMillis()
+
+        val captureStartNanos = SystemClock.elapsedRealtimeNanos()
 
         val frame = cameraManager.captureSingleFrameSuspend(timeoutMs)
             ?: return@withContext Result.failure(
                 IllegalStateException("Camera capture failed")
             )
 
-        val captureEnd = System.currentTimeMillis()
+        val captureEndNanos = SystemClock.elapsedRealtimeNanos()
 
-        /**
+        /* ================================================================
+         * STEP 3 — TEMPORAL VALIDATION
          * ================================================================
-         * ✅ CRITICAL FIX — TEMPORAL SYNCHRONIZATION
-         * ================================================================
-         *
-         * Ensures that:
-         *   image timestamp ≈ location timestamp
-         *
-         * Constraint:
-         *   |T_location - T_capture| ≤ 500ms
          *
          * Prevents:
-         *   ❌ Cached GPS replay
-         *   ❌ Time-of-check/time-of-use mismatch
+         *   - stale GPS reuse
+         *   - TOCTOU inconsistencies
          */
-        val delta = abs(locationTime - captureEnd)
 
-        if (delta > 500) {
+        val locationNanos =
+            location.timestampMillis * 1_000_000
+
+        val deltaMillis =
+            abs(locationNanos - captureEndNanos) / 1_000_000
+
+        if (deltaMillis > 500) {
             frame.recycle()
             return@withContext Result.failure(
-                IllegalStateException("Sensor desynchronization detected")
+                IllegalStateException("Temporal desynchronization")
+            )
+        }
+
+        /**
+         * Spatial constraint:
+         * Ensures location is meaningful.
+         */
+        if ((location.accuracyMeters ?: 999f) > 50f) {
+            frame.recycle()
+            return@withContext Result.failure(
+                IllegalStateException("Low location accuracy")
             )
         }
 
         try {
 
             /* ============================================================
-             * STEP 3 — TIME SNAPSHOT
+             * STEP 4 — TIME SNAPSHOT
              * ============================================================ */
+
             val timeSnapshot = TimeSource.snapshot()
 
             val snapshot = PhysicalRealitySnapshot(
                 frozenFrame = frame,
                 timeSnapshot = timeSnapshot,
-                locationEvidence = locationResult.evidence
+                locationEvidence = location
             )
 
             val snapshotId = UUID.randomUUID()
             val createdAt = System.currentTimeMillis()
 
             /* ============================================================
-             * STEP 4 — CANONICAL PAYLOAD
+             * STEP 5 — CANONICAL PAYLOAD CONSTRUCTION
              * ============================================================ */
 
             val imageHash = hashBitmap(frame)
             val timeBytes = timeSnapshot.toCanonicalBytes()
-            val locationBytes = locationResult.evidence.toCanonicalBytes()
+            val locationBytes = location.toCanonicalBytes()
 
             val payload =
-                intToBytes(imageHash.size) + imageHash +
-                        intToBytes(timeBytes.size) + timeBytes +
-                        intToBytes(locationBytes.size) + locationBytes
+                CanonicalSerializer.intToBytes(imageHash.size) + imageHash +
+                        CanonicalSerializer.intToBytes(timeBytes.size) + timeBytes +
+                        CanonicalSerializer.intToBytes(locationBytes.size) + locationBytes
 
             /* ============================================================
-             * STEP 5 — HASH
+             * STEP 6 — HASH GENERATION
              * ============================================================ */
+
             val snapshotHash =
                 MessageDigest.getInstance("SHA-256").digest(payload)
 
             /* ============================================================
-             * STEP 6 — SIGNATURE (HARDWARE)
+             * STEP 7 — HARDWARE SIGNATURE
              * ============================================================ */
+
             val signature =
                 HardwareBackedSnapshotSigner.sign(snapshotHash)
 
@@ -273,8 +303,9 @@ class PhysicalRealityBuilder(
                     .map { it.encoded }
 
             /* ============================================================
-             * STEP 7 — FINAL OBJECT
+             * STEP 8 — FINALIZATION
              * ============================================================ */
+
             return@withContext Result.success(
                 SignedPhysicalRealitySnapshot(
                     snapshotId = snapshotId,

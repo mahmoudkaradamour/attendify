@@ -1,246 +1,284 @@
 package com.mahmoud.attendify.forensics.wal
 
-import java.util.concurrent.ConcurrentHashMap
+import android.util.Base64
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+
+import com.mahmoud.attendify.forensics.wal.db.WalDao
+import com.mahmoud.attendify.forensics.wal.db.WalEntity
 
 /**
  * =============================================================================
- * 🧠 WalManager — Transactional Write-Ahead Logging Engine
+ * 🧠 WAL Manager — Persistent Forensic Transaction Ledger
  * =============================================================================
  *
  * -----------------------------------------------------------------------------
- * 🧠 FORMAL MODEL
+ * 📌 FORMAL DEFINITION
  * -----------------------------------------------------------------------------
  *
- * A Write-Ahead Log (WAL) enforces the principle:
+ * Let:
  *
- *   Log-before-state
+ *   T = logical transaction (attendance event)
+ *   W = write-ahead log (persistent journal)
  *
- * Formally:
+ * Each transaction must follow:
  *
- *   ∀ transaction T:
- *       WAL(T) must be recorded before Commit(T)
+ *   BEGIN(T) → COMMIT(T)
  *
- * -----------------------------------------------------------------------------
- * 📊 TRANSACTION STATE MACHINE
- * -----------------------------------------------------------------------------
+ * If system crashes:
  *
- *              BEGIN
- *                │
- *                ▼
- *         ┌─────────────┐
- *         │ INITIATED   │
- *         └──────┬──────┘
- *                │
- *                ▼
- *         ┌─────────────┐
- *         │ COMMITTED   │
- *         └─────────────┘
- *
- * Any state that does not reach COMMITTED is considered:
- *
- *   → INCOMPLETE
- *   → SUSPICIOUS
- *   → RECOVERABLE / DISCARDABLE
+ *   W preserves incomplete transactions → recoverable state
  *
  * -----------------------------------------------------------------------------
- * 📊 EXECUTION FLOW
+ * 🎯 PURPOSE
  * -----------------------------------------------------------------------------
  *
- *   BEGIN TRANSACTION
- *        ↓
- *   Write WAL Record
- *        ↓
- *   Execute Pipeline
- *        ↓
- *   Commit WAL Record
+ * Provide a **durable, append-only, crash-safe log**
+ * for all critical security operations.
  *
  * -----------------------------------------------------------------------------
- * 🔐 SECURITY GUARANTEES
+ * 💡 WHAT IS A WAL (WRITE-AHEAD LOG)?
  * -----------------------------------------------------------------------------
  *
- * ✅ Crash Consistency
- * ✅ Detection of Half-executed operations
- * ✅ Replay traceability
- * ✅ Anti-silent-failure
+ * WAL is a fundamental database concept:
+ *
+ *   BEFORE modifying system state:
+ *     → operation is recorded in durable storage
+ *
+ * Guarantees:
+ *
+ *   ✅ Crash consistency
+ *   ✅ Atomicity support
+ *   ✅ Audit trail (forensics)
  *
  * -----------------------------------------------------------------------------
- * ⚠️ ADVERSARIAL MODEL CONSIDERATIONS
+ * 📊 TRANSACTION FLOW (STATE MACHINE)
  * -----------------------------------------------------------------------------
  *
- * This implementation explicitly defends against:
+ *   ┌───────────┐
+ *   │ BEGIN(T)  │
+ *   └─────┬─────┘
+ *         ▼
+ *   ┌───────────────┐
+ *   │ INITIATED     │  ← written to DB
+ *   └─────┬─────────┘
+ *         ▼
+ *   ┌───────────────┐
+ *   │ EXECUTION     │  (hash + signature + network)
+ *   └─────┬─────────┘
+ *         ▼
+ *   ┌───────────────┐
+ *   │ COMMIT(T)     │
+ *   └─────┬─────────┘
+ *         ▼
+ *   ┌───────────────┐
+ *   │ COMMITTED     │  ← final durable state
+ *   └───────────────┘
  *
- *   - Transaction flooding (WAL exhaustion attacks)
- *   - Infinite incomplete transactions
- *   - Resource starvation via repeated BEGIN without COMMIT
+ * -----------------------------------------------------------------------------
+ * ⚠️ FAILURE SCENARIOS
+ * -----------------------------------------------------------------------------
  *
+ * If crash occurs:
+ *
+ *   Case A:
+ *     INITIATED exists but no COMMIT
+ *     → "Suspicious / incomplete transaction"
+ *
+ *   Case B:
+ *     No record
+ *     → transaction never started
+ *
+ * -----------------------------------------------------------------------------
+ * 🔐 SECURITY PROPERTIES
+ * -----------------------------------------------------------------------------
+ *
+ *   ✅ Durability:
+ *       Data survives process crash
+ *
+ *   ✅ Atomic visibility:
+ *       Only committed data considered finalized
+ *
+ *   ✅ Forensic trace:
+ *       Every action is recoverable
+ *
+ *   ✅ Replay reconstruction:
+ *       Unfinished transactions can be analyzed
+ *
+ * -----------------------------------------------------------------------------
+ * ❗ CRITICAL RULES
+ * -----------------------------------------------------------------------------
+ *
+ *   1. BEGIN must ALWAYS be called before execution
+ *   2. COMMIT must ONLY happen after success
+ *   3. Hash must be deterministic (Base64, never toString)
+ *   4. WAL is append-oriented (no destructive edits)
+ *
+ * =============================================================================
  */
-class WalManager {
+class WalManager(
+    private val dao: WalDao
+) {
+
+    /* =========================================================================
+     * 🧩 CONFIGURATION
+     * ========================================================================= */
 
     /**
-     * =========================================================================
-     * 🧠 INTERNAL STORAGE MODEL
-     * =========================================================================
+     * Time-To-Live for WAL entries (milliseconds)
      *
-     * Concurrent map provides:
+     * Old entries are removed to:
+     *   - prevent unbounded growth
+     *   - keep forensic window manageable
      *
-     *   ✅ Thread safety
-     *   ✅ Lock-free reads
-     *   ✅ Deterministic record overwrite behavior
-     *
-     * NOTE:
-     * This is an in-memory WAL representation.
-     * Persistent WAL must be implemented in a storage layer.
+     * Typical design:
+     *   10–30 minutes
      */
-    private val walStore = ConcurrentHashMap<String, WalRecord>()
+    private val TTL_MS = 15 * 60 * 1000L
 
-    /**
-     * =========================================================================
-     * 🔒 CONFIGURATION PARAMETERS
-     * =========================================================================
-     */
-
-    /**
-     * Maximum allowed uncommitted transactions.
-     * Prevents WAL flooding attacks.
-     */
-    private val maxUncommitted = 5
-
-    /**
-     * Time-to-live for incomplete transactions (milliseconds).
-     *
-     * Any transaction older than TTL:
-     *   → considered stale
-     *   → automatically ignored or purged
-     */
-    private val ttlMillis = 15 * 60 * 1000L // 15 minutes
-
-    /**
-     * =========================================================================
+    /* =========================================================================
      * 🚀 BEGIN TRANSACTION
-     * =========================================================================
-     *
-     * Registers a transaction BEFORE execution.
-     *
-     * -----------------------------------------------------------------------------
-     * 🧠 CRITICAL PROPERTY
-     * -----------------------------------------------------------------------------
-     *
-     * Guarantees:
-     *
-     *   BEGIN(T) happens-before EXECUTE(T)
+     * ========================================================================= */
+
+    /**
+     * Records the START of a security-critical transaction.
      *
      * -----------------------------------------------------------------------------
-     * 🔐 SECURITY
+     * INPUT:
+     *   id               → unique transaction identifier
+     *   payloadHashBytes → SHA-256 hash of payload
+     *
      * -----------------------------------------------------------------------------
+     * PROCESS:
      *
-     * Prevents:
+     *   1. Encode hash in Base64 (canonical representation)
+     *   2. Insert WAL entry with state = INITIATED
      *
-     *   ❌ execution without trace
-     *   ❌ invisible operation starts
+     * -----------------------------------------------------------------------------
+     * DESIGN NOTE:
      *
+     * We store the hash (not raw payload) to:
+     *   ✅ minimize storage
+     *   ✅ preserve privacy
+     *   ✅ ensure immutability
      */
-    fun begin(id: String, payloadHash: String) {
+    suspend fun begin(
+        id: String,
+        payloadHashBytes: ByteArray
+    ) {
 
-        val now = System.currentTimeMillis()
-
-        /**
-         * -------------------------------------------------------------
-         * ✅ Anti-flood protection
-         * -------------------------------------------------------------
-         *
-         * Rejects new transactions if too many are incomplete.
-         */
-        val incompleteCount = walStore.values.count {
-            it.state != WalState.COMMITTED &&
-                    (now - it.timestamp) < ttlMillis
-        }
-
-        if (incompleteCount >= maxUncommitted) {
-            throw IllegalStateException("WAL flood detected")
-        }
-
-        walStore[id] = WalRecord(
-            id = id,
-            timestamp = now,
-            payloadHash = payloadHash,
-            state = WalState.INITIATED
+        val encodedHash = Base64.encodeToString(
+            payloadHashBytes,
+            Base64.NO_WRAP
         )
+
+        val entity = WalEntity(
+            id = id,
+            timestamp = System.currentTimeMillis(),
+            payloadHash = encodedHash,
+            state = "INITIATED"
+        )
+
+        dao.insert(entity)
     }
 
-    /**
-     * =========================================================================
+    /* =========================================================================
      * ✅ COMMIT TRANSACTION
-     * =========================================================================
-     *
-     * Marks transaction as successfully completed.
-     *
-     * -----------------------------------------------------------------------------
-     * 🧠 SEMANTICS
-     * -----------------------------------------------------------------------------
-     *
-     *   Commit(T) → durable success signal
-     *
-     * -----------------------------------------------------------------------------
-     * 🔐 SECURITY
-     * -----------------------------------------------------------------------------
-     *
-     * Guarantees:
-     *
-     *   ✅ Transaction visible as completed
-     *   ✅ Cannot be recovered as incomplete
-     */
-    fun commit(id: String) {
-
-        walStore[id]?.let {
-            walStore[id] = it.copy(
-                state = WalState.COMMITTED
-            )
-        }
-    }
+     * ========================================================================= */
 
     /**
-     * =========================================================================
-     * 🔍 RECOVERY MECHANISM
-     * =========================================================================
-     *
-     * Identifies all incomplete transactions.
+     * Marks transaction as COMPLETED.
      *
      * -----------------------------------------------------------------------------
-     * 🧠 RECOVERY DEFINITION
+     * RULE:
+     *   MUST only be called after:
+     *     - signature success
+     *     - persistence success
+     *
      * -----------------------------------------------------------------------------
+     * STATE TRANSITION:
      *
-     *   Incomplete(T) =
-     *     state(T) != COMMITTED
+     *   INITIATED → COMMITTED
      *
      * -----------------------------------------------------------------------------
-     * 📊 FILTERING LOGIC
-     * -----------------------------------------------------------------------------
+     * FAILURE SAFETY:
      *
-     *   1. Remove expired (TTL) entries
-     *   2. Return only valid incomplete records
-     *
+     *   If commit never happens:
+     *     → transaction remains visible for recovery
      */
-    fun getUncommitted(): List<WalRecord> {
+    suspend fun commit(id: String) = withContext(NonCancellable) {
+
+        val current =
+            dao.getUncommitted().find { it.id == id }
+                ?: return@withContext
+
+        val updated = current.copy(state = "COMMITTED")
+
+        dao.update(updated)
+    }
+
+    /* =========================================================================
+     * 🔄 RECOVERY ENGINE
+     * ========================================================================= */
+
+    /**
+     * Recovers incomplete transactions on startup.
+     *
+     * -----------------------------------------------------------------------------
+     * PROCESS:
+     *
+     *   1. Remove expired records (TTL cleanup)
+     *   2. Return all transactions where state != COMMITTED
+     *
+     * -----------------------------------------------------------------------------
+     * OUTPUT:
+     *
+     *   List of suspicious/incomplete transactions
+     *
+     * -----------------------------------------------------------------------------
+     * USE-CASE:
+     *
+     *   Called at application startup:
+     *
+     *   if (pending not empty):
+     *       → log anomaly
+     *       → optional retransmission
+     */
+    @Suppress("unused")
+    suspend fun recover(): List<WalEntity> {
 
         val now = System.currentTimeMillis()
 
-        /**
-         * -------------------------------------------------------------
-         * ✅ TTL-based cleanup (lazy purge)
-         * -------------------------------------------------------------
-         */
-        walStore.entries.removeIf {
-            val expired = (now - it.value.timestamp) > ttlMillis
-            expired
-        }
+        /* ---------- TTL CLEANUP ---------- */
+        dao.deleteOlderThan(now - TTL_MS)
 
-        /**
-         * -------------------------------------------------------------
-         * ✅ Return active incomplete transactions
-         * -------------------------------------------------------------
-         */
-        return walStore.values.filter {
-            it.state != WalState.COMMITTED
-        }
+        /* ---------- UNCOMMITTED ---------- */
+        return dao.getUncommitted()
+    }
+
+    /* =========================================================================
+     * 🧪 DEBUG / FORENSIC UTILITIES
+     * ========================================================================= */
+
+    /**
+     * Verifies if a transaction exists in WAL.
+     *
+     * Useful for:
+     *   - debugging
+     *   - test assertions
+     */
+    suspend fun exists(id: String): Boolean {
+
+        return dao.getUncommitted().any { it.id == id }
+    }
+
+    /**
+     * Clears all WAL data (TESTING ONLY)
+     *
+     * ⚠️ NEVER use in production forensic flows
+     */
+    @Suppress("unused")
+    suspend fun clearAll() {
+        dao.deleteOlderThan(Long.MAX_VALUE)
     }
 }

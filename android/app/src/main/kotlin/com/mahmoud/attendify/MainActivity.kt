@@ -1,103 +1,152 @@
 package com.mahmoud.attendify
 
-import android.Manifest
-import android.content.pm.PackageManager
+import android.content.Intent
+import android.graphics.Color
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.widget.FrameLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+
 import androidx.camera.view.PreviewView
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import androidx.core.view.isVisible
+import androidx.core.view.setPadding
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+
 import kotlinx.coroutines.*
 
-/* ============================================================================ */
-import com.mahmoud.attendify.camera.CameraManager
-import com.mahmoud.attendify.camera.SystemStatusReporter
-/* ============================================================================ */
-import com.mahmoud.attendify.orchestration.AttendanceRuntimeOrchestrator
-import com.mahmoud.attendify.orchestration.PhysicalRealityBuilder
-/* ============================================================================ */
-import com.mahmoud.attendify.attendance.usecase.AttendanceUseCase
-/* ============================================================================ */
+/* ================= UI ================= */
+import com.mahmoud.attendify.ui.onboarding.DisclosureActivity
+import com.mahmoud.attendify.ui.controller.AttendanceUiController
+import com.mahmoud.attendify.ui.state.AttendanceUiState
+
+/* ================= CAMERA ================= */
+import com.mahmoud.attendify.camera.*
+
+/* ================= ORCHESTRATION ================= */
+import com.mahmoud.attendify.orchestration.*
+
+/* ================= DOMAIN ================= */
+import com.mahmoud.attendify.attendance.usecase.*
+
+/* ================= FACE ================= */
 import com.mahmoud.attendify.face.*
 import com.mahmoud.attendify.matching.*
-import com.mahmoud.attendify.repository.local.LocalEncryptedEmployeeReferenceRepository
+import com.mahmoud.attendify.repository.local.*
 import com.mahmoud.attendify.policy.*
 import com.mahmoud.attendify.liveness.engine.FacialMetricsEngine
-/* ============================================================================ */
+
+/* ================= SYSTEM ================= */
 import com.mahmoud.attendify.system.time.*
 import com.mahmoud.attendify.system.location.*
 import com.mahmoud.attendify.system.time.working.*
-/* ============================================================================ */
+
+/* ================= FORENSICS ================= */
 import com.mahmoud.attendify.forensics.*
-import com.mahmoud.attendify.forensics.repository.ForensicAuditRepository
+import com.mahmoud.attendify.forensics.repository.*
 import com.mahmoud.attendify.forensics.db.*
-import com.mahmoud.attendify.forensics.wal.WalManager
-/* ============================================================================ */
+import com.mahmoud.attendify.forensics.wal.*
+import com.mahmoud.attendify.forensics.wal.db.WalDatabase
+
+/* ================= SECURITY ================= */
 import com.mahmoud.attendify.security.*
-import com.mahmoud.attendify.security.legal.LegalEvidenceWriter
-/* ============================================================================ */
-import com.mahmoud.attendify.storage.recovery.AttemptRecoveryManager
-/* ============================================================================ */
+import com.mahmoud.attendify.security.legal.*
+
+/* ================= LIFECYCLE ================= */
+import com.mahmoud.attendify.attendance.lifecycle.*
+
+/* ================= RECOVERY ================= */
+import com.mahmoud.attendify.storage.recovery.*
+
+/* ================= APP ================= */
+import com.mahmoud.attendify.app.AppContextProvider
 import com.mahmoud.attendify.attendance.config.AttendancePolicyProvider
+
+/* ================= CHANNEL ================= */
 import com.mahmoud.attendify.channel.AttendanceMethodChannel
 
 /**
  * =============================================================================
- * 🧠 MainActivity — System Composition Root
+ * 🧠 MainActivity — Composition Root + Reactive UI + Execution Gateway
  * =============================================================================
  *
  * -----------------------------------------------------------------------------
- * 🧠 ARCHITECTURAL ROLE
+ * 📌 FORMAL ROLE
  * -----------------------------------------------------------------------------
  *
- * This class is the **only place where objects are constructed**.
+ * This class implements three major responsibilities:
  *
- * It defines:
+ * 1. Dependency Composition:
+ *      Builds complete object graph (manual dependency injection)
  *
- *   ✅ Object graph (Dependency Injection without framework)
- *   ✅ System startup sequence
- *   ✅ Execution pipeline wiring
+ * 2. UI Projection Layer:
+ *      Maps system states → human-readable feedback
+ *
+ * 3. Execution Gateway:
+ *      Connects Flutter / UI → Orchestrator
  *
  * -----------------------------------------------------------------------------
- * 📊 SYSTEM INITIALIZATION FLOW
+ * 📊 SYSTEM FLOW
  * -----------------------------------------------------------------------------
  *
- *   App Start
+ *   App Launch
  *       │
  *       ▼
- *   Initialize Context
+ *   Disclosure Gate
  *       │
  *       ▼
- *   Initialize Security Guards
+ *   Initialize Systems
  *       │
  *       ▼
- *   Initialize WAL (transaction log)
+ *   Build Orchestrator
  *       │
  *       ▼
- *   Initialize Forensic Ledger
+ *   Start Camera
  *       │
  *       ▼
- *   Verify Integrity Chain
- *       │
- *       ▼
- *   Build Runtime Orchestrator
- *       │
- *       ▼
- *   Recovery Check
- *       │
- *       ▼
- *   Start Camera Preview
+ *   UI reacts to StateFlow
+ *
+ * -----------------------------------------------------------------------------
+ * 🧠 UI MODEL (STATE-DRIVEN)
+ * -----------------------------------------------------------------------------
+ *
+ *   AttendanceUiState
+ *        │
+ *        ▼
+ *   UI Controller
+ *        │
+ *        ▼
+ *   Text + Progress + Animation
  *
  * -----------------------------------------------------------------------------
  * 🔐 SECURITY MODEL
  * -----------------------------------------------------------------------------
  *
- * UI Layer  → UNTRUSTED
- * Activity  → CONFIGURATION ONLY
- * Core      → TRUSTED EXECUTION ENGINE
+ * Activity is UNTRUSTED:
+ *   - Cannot make decisions
  *
+ * Orchestrator is TRUSTED:
+ *   - Executes verified pipeline
+ *
+ * -----------------------------------------------------------------------------
+ * 🎬 UX GOAL
+ * -----------------------------------------------------------------------------
+ *
+ * Transform raw execution into:
+ *
+ *   → Perceived intelligence
+ *   → Smooth transitions
+ *   → Trustworthy interface
+ *
+ * =============================================================================
  */
 class MainActivity : FlutterActivity() {
 
@@ -105,43 +154,61 @@ class MainActivity : FlutterActivity() {
     private lateinit var cameraManager: CameraManager
     private lateinit var orchestrator: AttendanceRuntimeOrchestrator
 
+    private val uiController = AttendanceUiController()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         /* ================================================================
-         * 🧠 GLOBAL CONTEXT
+         * 🔐 DISCLOSURE GATE
          * ================================================================ */
-        com.mahmoud.attendify.app.AppContextProvider
-            .initialize(applicationContext)
+
+        if (!isDisclosureAccepted()) {
+            startActivity(Intent(this, DisclosureActivity::class.java))
+            finish()
+            return
+        }
 
         /* ================================================================
-         * 🔐 REPLAY PROTECTION
+         * 🧠 CORE INITIALIZATION
          * ================================================================ */
+
+        AppContextProvider.initialize(applicationContext)
         ReplayProtectionGuard.initialize { applicationContext }
 
-        /* ================================================================
-         * 🧾 WAL MANAGER (TRANSACTION JOURNAL)
-         * ================================================================ */
-        val walManager = WalManager()
-
-        /**
-         * WAL guarantees:
-         *
-         *   BEGIN → PROCESS → COMMIT
-         *
-         * If the system crashes:
-         *   → WAL reveals incomplete transaction
-         */
+        val walManager =
+            WalManager(WalDatabase.get(applicationContext).walDao())
 
         /* ================================================================
-         * 🎥 UI LAYER
+         * 🎥 UI LAYER (CAMERA + OVERLAY)
          * ================================================================ */
+
+        val root = FrameLayout(this)
+
         previewView = PreviewView(this)
-        setContentView(previewView)
+
+        val statusText = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setPadding(40)
+            alpha = 1f
+        }
+
+        val progress = ProgressBar(this).apply {
+            visibility = View.GONE
+        }
+
+        root.addView(previewView)
+        root.addView(statusText)
+        root.addView(progress)
+
+        setContentView(root)
 
         /* ================================================================
          * 📸 CAMERA
          * ================================================================ */
+
         cameraManager = CameraManager(
             context = this,
             lifecycleOwner = this,
@@ -149,183 +216,220 @@ class MainActivity : FlutterActivity() {
         )
 
         /* ================================================================
-         * 🗄 FORENSIC LEDGER
+         * 🗄 FORENSIC LAYER
          * ================================================================ */
-        val db = androidx.room.Room.databaseBuilder(
-            applicationContext,
-            ForensicDatabase::class.java,
-            "forensic.db"
-        ).build()
 
-        val repository = ForensicAuditRepository(db.auditDao())
-        val auditWriter = ForensicAuditTrailWriter(repository)
+        val db = ForensicDatabase.getInstance(applicationContext)
+
+        val auditWriter =
+            ForensicAuditTrailWriter(
+                ForensicAuditRepository(db.auditDao())
+            )
+
+        val legalWriter = LegalEvidenceWriter()
 
         /* ================================================================
-         * 🔐 CHAIN VERIFICATION
+         * 🧠 ORCHESTRATOR
          * ================================================================ */
-        CoroutineScope(Dispatchers.IO).launch {
 
-            val valid = repository.verifyChain()
-
-            if (!valid) {
-                auditWriter.appendSystemEvent(
-                    "LEDGER_TAMPER_DETECTED",
-                    "Integrity chain broken"
-                )
-            }
-        }
-
-        /* ================================================================
-         * ⚖️ LEGAL LAYER
-         * ================================================================ */
-        val legalEvidenceWriter = LegalEvidenceWriter()
-
-        /* ================================================================
-         * 🧠 ORCHESTRATOR CONSTRUCTION
-         * ================================================================ */
-        orchestrator = buildAttendanceRuntime(
+        orchestrator = buildRuntime(
             cameraManager,
             auditWriter,
-            legalEvidenceWriter,
+            legalWriter,
             walManager
         )
 
         /* ================================================================
-         * 🧯 RECOVERY SYSTEM
+         * 🔄 RECOVERY
          * ================================================================ */
-        val recoveryManager = AttemptRecoveryManager(
-            lifecycleManager = orchestrator.lifecycleManager,
-            auditWriter = auditWriter
-        )
 
-        CoroutineScope(Dispatchers.IO).launch {
-            recoveryManager.runRecoveryCheck()
+        lifecycleScope.launch(Dispatchers.IO) {
+            AttemptRecoveryManager(
+                orchestrator.lifecycleManager,
+                auditWriter
+            ).runRecoveryCheck()
         }
 
         /* ================================================================
-         * 🔑 PERMISSIONS
+         * 🎬 REACTIVE UI BINDING (MODERN / SAFE)
          * ================================================================ */
-        checkCameraPermissionAndStart()
+
+        lifecycleScope.launch {
+
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+
+                var lastState: AttendanceUiState? = null
+
+                uiController.state.collect { state ->
+
+                    if (state == lastState) return@collect
+                    lastState = state
+
+                    val text = mapState(state)
+
+                    animateText(statusText, text)
+                    animateProgress(progress, state)
+                }
+            }
+        }
+
+        /* ================================================================
+         * 🚀 START CAMERA
+         * ================================================================ */
+
+        cameraManager.startCamera(previewView.surfaceProvider)
     }
 
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-        super.configureFlutterEngine(flutterEngine)
+    /* =========================================================================
+     * 🎬 TEXT ANIMATION
+     * ========================================================================= */
+
+    private fun animateText(view: TextView, newText: String) {
+
+        view.animate()
+            .alpha(0f)
+            .setDuration(150)
+            .withEndAction {
+
+                view.text = newText
+
+                view.animate()
+                    .alpha(1f)
+                    .setDuration(150)
+                    .start()
+            }
+    }
+
+    /* =========================================================================
+     * 🔄 PROGRESS ANIMATION
+     * ========================================================================= */
+
+    private fun animateProgress(progress: ProgressBar, state: AttendanceUiState) {
+
+        val show =
+            state !is AttendanceUiState.Idle &&
+                    state !is AttendanceUiState.Success
+
+        if (show && progress.visibility != View.VISIBLE) {
+
+            progress.visibility = View.VISIBLE
+
+            progress.scaleX = 0.8f
+            progress.scaleY = 0.8f
+            progress.alpha = 0f
+
+            progress.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(300)
+                .setInterpolator(AccelerateDecelerateInterpolator())
+                .start()
+
+        } else if (!show && progress.isVisible) {
+
+            progress.animate()
+                .alpha(0f)
+                .scaleX(0.8f)
+                .scaleY(0.8f)
+                .setDuration(200)
+                .withEndAction {
+                    progress.visibility = View.GONE
+                }
+                .start()
+        }
+    }
+
+    /* =========================================================================
+     * 🔌 FLUTTER BRIDGE
+     * ========================================================================= */
+
+    override fun configureFlutterEngine(engine: FlutterEngine) {
+        super.configureFlutterEngine(engine)
 
         MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
+            engine.dartExecutor.binaryMessenger,
             "attendance_channel"
         ).setMethodCallHandler(
             AttendanceMethodChannel(orchestrator)
         )
     }
 
-    private fun checkCameraPermissionAndStart() {
-        if (
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            startCameraPreview()
-        } else {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.CAMERA),
-                1001
-            )
-        }
-    }
+    /* =========================================================================
+     * 🧱 DEPENDENCY GRAPH
+     * ========================================================================= */
 
-    private fun startCameraPreview() {
-        cameraManager.startCamera(
-            preview = previewView.surfaceProvider
+    private fun buildRuntime(
+        camera: CameraManager,
+        audit: ForensicAuditTrailWriter,
+        legal: LegalEvidenceWriter,
+        wal: WalManager
+    ): AttendanceRuntimeOrchestrator {
+
+        return AttendanceRuntimeOrchestrator(
+            this,
+            PhysicalRealityBuilder(
+                camera,
+                LocationIntegrityGuard(
+                    this,
+                    AttendancePolicyProvider.locationPolicy(),
+                    null,
+                    LocationSource(this),
+                    SecureLocationAnchorStorage(this)
+                )
+            ),
+            FaceDetector(this),
+            MobileFaceNet(this),
+            null,
+            FacialMetricsEngine(),
+            FaceMatchingOrchestrator(
+                MatchingPolicy(1.1, ReferenceValidationPolicy.NEVER_VALIDATE_AT_ATTENDANCE),
+                ReferenceAccessPolicy.LOCAL_ONLY,
+                LocalEncryptedEmployeeReferenceRepository(this)
+            ),
+            AttendanceUseCase(
+                TimeIntegrityGuard(
+                    this,
+                    AttendancePolicyProvider.timePolicy(),
+                    SecureTimeAnchorStorage(this)
+                ),
+                AttendanceTimeProofFactory(
+                    SecureTimeAnchorStorage(this),
+                    GpsTimeProvider(this)
+                ),
+                SecureTimeAnchorStorage(this),
+                AttendancePolicyProvider.zonePolicy(),
+                WorkingTimeEvaluator(
+                    AttendancePolicyProvider.workingTimePolicy()
+                )
+            ),
+            audit,
+            legal,
+            wal,
+            AttemptLifecycleManager(applicationContext)
         )
     }
 
     /* =========================================================================
-     * 🧠 DEPENDENCY GRAPH CONSTRUCTION
+     * 🧠 STATE → TEXT
      * ========================================================================= */
 
-    private fun buildAttendanceRuntime(
-        cameraManager: CameraManager,
-        auditWriter: ForensicAuditTrailWriter,
-        legalEvidenceWriter: LegalEvidenceWriter,
-        walManager: WalManager
-    ): AttendanceRuntimeOrchestrator {
+    private fun mapState(state: AttendanceUiState): String =
+        when (state) {
+            AttendanceUiState.Idle -> "Ready"
+            AttendanceUiState.Securing -> "Securing..."
+            AttendanceUiState.Capturing -> "Capturing..."
+            AttendanceUiState.Processing -> "Verifying..."
+            AttendanceUiState.Success -> "✅ Success"
+            is AttendanceUiState.Error -> "❌ ${state.message}"
+        }
 
-        /* ---------------- BIOMETRICS ---------------- */
-        val faceDetector = FaceDetector(this)
-        val faceNet = MobileFaceNet(this)
+    /* =========================================================================
+     * 🔐 DISCLOSURE CHECK
+     * ========================================================================= */
 
-        val faceMatchingOrchestrator =
-            FaceMatchingOrchestrator(
-                policy = MatchingPolicy(
-                    defaultThreshold = 1.1,
-                    referenceValidationPolicy =
-                        ReferenceValidationPolicy.NEVER_VALIDATE_AT_ATTENDANCE
-                ),
-                referenceAccessPolicy = ReferenceAccessPolicy.LOCAL_ONLY,
-                repository =
-                    LocalEncryptedEmployeeReferenceRepository(this)
-            )
-
-        /* ---------------- LOCATION ---------------- */
-        val locationIntegrityGuard =
-            LocationIntegrityGuard(
-                context = this,
-                policy = AttendancePolicyProvider.locationPolicy(),
-                zonesPolicy = null,
-                locationSource = LocationSource(this),
-                anchorStorage = SecureLocationAnchorStorage(this)
-            )
-
-        /* ---------------- DOMAIN ---------------- */
-        val attendanceUseCase =
-            AttendanceUseCase(
-                timeIntegrityGuard =
-                    TimeIntegrityGuard(
-                        context = this,
-                        policy = AttendancePolicyProvider.timePolicy(),
-                        anchorStorage = SecureTimeAnchorStorage(this)
-                    ),
-                timeProofFactory =
-                    AttendanceTimeProofFactory(
-                        SecureTimeAnchorStorage(this),
-                        GpsTimeProvider(this)
-                    ),
-                timeAnchorStorage =
-                    SecureTimeAnchorStorage(this),
-                zonesPolicy =
-                    AttendancePolicyProvider.zonePolicy(),
-                workingTimeEvaluator =
-                    WorkingTimeEvaluator(
-                        AttendancePolicyProvider.workingTimePolicy()
-                    )
-            )
-
-        val physicalRealityBuilder =
-            PhysicalRealityBuilder(
-                cameraManager,
-                locationIntegrityGuard
-            )
-
-        val lifecycleManager =
-            com.mahmoud.attendify.attendance.lifecycle
-                .AttemptLifecycleManager(applicationContext)
-
-        /* ---------------- FINAL ENGINE ---------------- */
-        return AttendanceRuntimeOrchestrator(
-            physicalRealityBuilder = physicalRealityBuilder,
-            faceDetector = faceDetector,
-            faceNet = faceNet,
-            livenessOrchestrator = null,
-            facialMetricsEngine = FacialMetricsEngine(),
-            faceMatchingOrchestrator = faceMatchingOrchestrator,
-            attendanceUseCase = attendanceUseCase,
-            auditTrailWriter = auditWriter,
-            legalEvidenceWriter = legalEvidenceWriter,
-            walManager = walManager, // ✅ FIX
-            lifecycleManager = lifecycleManager
-        )
+    private fun isDisclosureAccepted(): Boolean {
+        val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+        return prefs.getBoolean("disclosure_accepted", false)
     }
 }

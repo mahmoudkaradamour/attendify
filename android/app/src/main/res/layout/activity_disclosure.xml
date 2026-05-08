@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!--
+=================================================================================
+🧠 Disclosure Layout — Privacy & Consent Interface
+=================================================================================
+
+
+📌 PURPOSE
+
+
+This layout implements the "Prominent Disclosure" requirement.
+
+Goal:
+    Clearly communicate to the user:
+
+        ✅ What data is used
+        ✅ Why it is used
+        ✅ How it is processed
+        ✅ What is NOT stored
+
+
+🧠 UX PRINCIPLE
+
+
+Human-centered design requires:
+
+    - Readability
+    - Clarity
+    - Trust-building language
+
+
+📊 VISUAL HIERARCHY (FLOW)
+
+
+    ┌──────────────────────────────┐
+    │ Title (Purpose)              │
+    ├──────────────────────────────┤
+    │ Explanation Text             │
+    ├──────────────────────────────┤
+    │ Bullet-like Information      │
+    ├──────────────────────────────┤
+    │ Continue Action              │
+    └──────────────────────────────┘
+
+===============================================================================
+🔐 SECURITY ROLE
+===============================================================================
+
+This screen acts as:
+
+    Trust Boundary BEFORE sensitive permission usage
+
+Prevents:
+    ❌ Silent biometric collection
+    ❌ Unexpected permission requests
+
+
+🧠 COGNITIVE DESIGN MODEL
+
+
+Users must understand the system within ≤ 5 seconds.
+
+Therefore:
+    - Simple language
+    - No technical jargon
+    - Direct relevance highlighted
+
+=================================================================================
+-->
+
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <!--
+    =========================================================================
+    🧠 ROOT CONTAINER — CENTERED CONTENT STRUCTURE
+    =========================================================================
+    -->
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:gravity="center_horizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <!-- ================================================================
+             🏷 TITLE
+             ================================================================= -->
+
+        <!--
+        High-level abstraction:
+        Immediately answers:
+            "What is this?"
+        -->
+        <TextView
+            android:id="@+id/title_disclosure"
+            android:text="Secure Attendance Verification"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="16dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+
+        <!-- ================================================================
+             📄 DESCRIPTION TEXT
+             ================================================================= -->
+
+        <!--
+        MUST include:
+            - camera purpose
+            - location purpose
+            - local processing claim
+            - no storage claim
+        -->
+        <TextView
+            android:id="@+id/txt_disclosure"
+            android:textSize="16sp"
+            android:lineSpacingExtra="4dp"
+            android:layout_marginBottom="20dp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="
+This application uses your camera and location to verify your presence securely.
+
+• Camera is used for facial verification
+• Location is used to confirm physical attendance
+
+All processing is performed locally on your device.
+
+No photos or biometric data are stored or transmitted externally.
+" />
+
+        <!-- ================================================================
+             🔐 TRUST INDICATORS
+             ================================================================= -->
+
+        <!--
+        Psychological reinforcement:
+            Builds confidence in the system
+        -->
+        <TextView
+            android:id="@+id/security_hint"
+            android:text="Your data remains private and secure."
+            android:textSize="14sp"
+            android:textColor="#4CAF50"
+            android:layout_marginBottom="24dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+
+        <!-- ================================================================
+             ✅ CONTINUE BUTTON
+             ================================================================= -->
+
+        <!--
+        Action semantics:
+            Explicit consent trigger
+
+        UX requirement:
+            Must NOT auto-proceed
+        -->
+        <Button
+            android:id="@+id/btn_continue"
+            android:text="Continue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <!-- ================================================================
+             ℹ OPTIONAL FOOTER (LEGAL CONTEXT)
+             ================================================================= -->
+
+        <!--
+        Additional compliance note:
+            Non-intrusive, low-priority placement
+        -->
+        <TextView
+            android:id="@+id/footer_note"
+            android:textSize="12sp"
+            android:layout_marginTop="16dp"
+            android:gravity="center"
+            android:textColor="#888888"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="By continuing, you agree to the usage described above." />
+
+    </LinearLayout>
+
+</ScrollView>
